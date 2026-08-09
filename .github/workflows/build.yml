@@ -39,10 +39,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: BumbleHeatFix
-          path: |
-            packages/*
-          if-no-files-found: error
-          path: |
-            packages/*
-            .theos/obj/**/*.dylib
+          path: packages/*
           if-no-files-found: error
