@@ -18,22 +18,32 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
 
+      - name: Verify Theos
+        run: |
+          echo "THEOS directory:"
+          ls -la "$HOME/theos"
+          echo "Checking common.mk:"
+          test -f "$HOME/theos/makefiles/common.mk"
+
       - name: Build dylib
         env:
-          THEOS: ${{ github.workspace }}/theos
+          THEOS: ${{ env.HOME }}/theos
         run: |
           make package FINALPACKAGE=1
 
-      - name: Find built files
+      - name: Show build output
         run: |
-          echo "=== Built files ==="
-          find . -type f \( -name "*.dylib" -o -name "*.deb" \) -print
+          echo "=== Packages ==="
+          find packages -maxdepth 2 -type f -print 2>/dev/null || true
 
-      - name: Upload dylib
+          echo "=== Dylibs ==="
+          find .theos -type f -name "*.dylib" -print 2>/dev/null || true
+
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: BumbleHeatFix
           path: |
+            packages/*
             .theos/obj/**/*.dylib
-            packages/*.deb
-          if-no-files-found: warn
+          if-no-files-found: error
