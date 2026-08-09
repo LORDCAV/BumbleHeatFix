@@ -20,21 +20,24 @@ jobs:
 
       - name: Verify Theos
         run: |
-          echo "THEOS directory:"
+          echo "HOME=$HOME"
+          echo "Theos location:"
           ls -la "$HOME/theos"
           echo "Checking common.mk:"
-          test -f "$HOME/theos/makefiles/common.mk"
+          ls -la "$HOME/theos/makefiles/common.mk"
 
-      - name: Build dylib
-        env:
-          THEOS: ${{ env.HOME }}/theos
+      - name: Build BumbleHeatFix
         run: |
+          export THEOS="$HOME/theos"
+          echo "THEOS=$THEOS"
+          echo "Checking:"
+          test -f "$THEOS/makefiles/common.mk"
           make package FINALPACKAGE=1
 
       - name: Show build output
         run: |
           echo "=== Packages ==="
-          find packages -maxdepth 2 -type f -print 2>/dev/null || true
+          find packages -type f -print 2>/dev/null || true
 
           echo "=== Dylibs ==="
           find .theos -type f -name "*.dylib" -print 2>/dev/null || true
