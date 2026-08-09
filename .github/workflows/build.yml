@@ -35,7 +35,19 @@ jobs:
           echo "=== Dylibs ==="
           find .theos -type f -name "*.dylib" -print 2>/dev/null || true
 
+          - name: Show staged files
+        run: |
+          echo "=== STAGED FILES ==="
+          find .theos/_ -type f -print
+
       - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: BumbleHeatFix
+          path: |
+            packages/*.deb
+            .theos/_/Library/MobileSubstrate/DynamicLibraries/*
+          if-no-files-found: error
         uses: actions/upload-artifact@v4
         with:
           name: BumbleHeatFix
