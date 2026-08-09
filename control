@@ -1,8 +1,0 @@
-Package: com.bumble.heatfix
-Name: BumbleHeatFix
-Version: 1.0.0
-Architecture: iphoneos-arm64
-Description: Educational BumbleHeatFix tweak
-Maintainer: BumbleHeatFix
-Author: BumbleHeatFix
-Section: Tweaks
