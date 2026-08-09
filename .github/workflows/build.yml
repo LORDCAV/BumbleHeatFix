@@ -18,20 +18,23 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
 
+      - name: Install ldid
+        run: |
+          brew install ldid-procursus
+
       - name: Verify Theos
         run: |
-          echo "HOME=$HOME"
-          echo "Theos location:"
-          ls -la "$HOME/theos"
+          export THEOS="$HOME/theos"
+          echo "THEOS=$THEOS"
           echo "Checking common.mk:"
-          ls -la "$HOME/theos/makefiles/common.mk"
+          test -f "$THEOS/makefiles/common.mk"
+          echo "Checking ldid:"
+          which ldid
+          ldid -h || true
 
       - name: Build BumbleHeatFix
         run: |
           export THEOS="$HOME/theos"
-          echo "THEOS=$THEOS"
-          echo "Checking:"
-          test -f "$THEOS/makefiles/common.mk"
           make package FINALPACKAGE=1
 
       - name: Show build output
