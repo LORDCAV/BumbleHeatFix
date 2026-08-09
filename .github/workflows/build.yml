@@ -1,0 +1,39 @@
+name: Build BumbleHeatFix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+
+      - name: Build dylib
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          make package FINALPACKAGE=1
+
+      - name: Find built files
+        run: |
+          echo "=== Built files ==="
+          find . -type f \( -name "*.dylib" -o -name "*.deb" \) -print
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: BumbleHeatFix
+          path: |
+            .theos/obj/**/*.dylib
+            packages/*.deb
+          if-no-files-found: warn
