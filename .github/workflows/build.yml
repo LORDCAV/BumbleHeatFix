@@ -37,14 +37,22 @@ jobs:
           export THEOS="$HOME/theos"
           make package FINALPACKAGE=1
 
-      - name: Show build output
-        run: |
-          echo "=== Packages ==="
-          find packages -type f -print 2>/dev/null || true
+    - name: Inspect Theos staging
+  run: |
+    echo "=== Packages ==="
+    find packages -type f -print 2>/dev/null || true
 
-          echo "=== Dylibs ==="
-          find .theos -type f -name "*.dylib" -print 2>/dev/null || true
+    echo "=== Dylibs ==="
+    find .theos -type f -name "*.dylib" -print 2>/dev/null || true
 
+    echo "=== Theos directory ==="
+    find .theos -maxdepth 6 -type f -print 2>/dev/null || true
+
+    echo "=== Project directory ==="
+    find . -maxdepth 6 -type f -print 2>/dev/null || true
+
+    echo "=== Stage directories ==="
+    find .theos -type d -print 2>/dev/null || true
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
