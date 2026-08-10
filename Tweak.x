@@ -5,184 +5,166 @@
 #import <mach/task_info.h>
 #import <mach/thread_act.h>
 
+static UILabel *BHFLabel = nil;
+static NSTimer *BHFTimer = nil;
+
 static void BHFLog(NSString *format, ...)
 {
     va_list args;
     va_start(args, format);
 
-    NSString *message =
-        [[NSString alloc] initWithFormat:format arguments:args];
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
 
     va_end(args);
 
     NSLog(@"[BumbleHeatFix] %@", message);
 }
 
-static double BHFGetCPUUsage(void)
+static double BHFCPU(void)
 {
-    task_t task = mach_task_self();
-
-    task_thread_times_info_data_t taskTime;
+    task_thread_times_info_data_t info;
     mach_msg_type_number_t count = TASK_THREAD_TIMES_INFO_COUNT;
 
-    kern_return_t kr =
-        task_info(
-            task,
-            TASK_THREAD_TIMES_INFO,
-            (task_info_t)&taskTime,
-            &count
-        );
+    kern_return_t result = task_info(
+        mach_task_self(),
+        TASK_THREAD_TIMES_INFO,
+        (task_info_t)&info,
+        &count
+    );
 
-    if (kr != KERN_SUCCESS)
+    if (result != KERN_SUCCESS)
         return -1.0;
 
-    uint64_t totalNanoseconds =
-        ((uint64_t)taskTime.user_time.seconds * 1000000000ULL) +
-        ((uint64_t)taskTime.user_time.microseconds * 1000ULL) +
-        ((uint64_t)taskTime.system_time.seconds * 1000000000ULL) +
-        ((uint64_t)taskTime.system_time.microseconds * 1000ULL);
+    uint64_t cpuTime =
+        ((uint64_t)info.user_time.seconds * 1000000000ULL) +
+        ((uint64_t)info.user_time.microseconds * 1000ULL) +
+        ((uint64_t)info.system_time.seconds * 1000000000ULL) +
+        ((uint64_t)info.system_time.microseconds * 1000ULL);
 
-    static uint64_t previousCPUTime = 0;
-    static CFAbsoluteTime previousTimestamp = 0;
+    static uint64_t oldCPU = 0;
+    static CFAbsoluteTime oldTime = 0;
 
-    CFAbsoluteTime currentTimestamp =
-        CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
-    if (previousCPUTime == 0)
+    if (oldCPU == 0)
     {
-        previousCPUTime = totalNanoseconds;
-        previousTimestamp = currentTimestamp;
+        oldCPU = cpuTime;
+        oldTime = now;
         return 0.0;
     }
 
-    uint64_t cpuDelta =
-        totalNanoseconds - previousCPUTime;
+    uint64_t cpuDifference = cpuTime - oldCPU;
+    CFAbsoluteTime timeDifference = now - oldTime;
 
-    CFAbsoluteTime timeDelta =
-        currentTimestamp - previousTimestamp;
+    oldCPU = cpuTime;
+    oldTime = now;
 
-    previousCPUTime = totalNanoseconds;
-    previousTimestamp = currentTimestamp;
-
-    if (timeDelta <= 0.0)
+    if (timeDifference <= 0.0)
         return 0.0;
 
-    return
-        ((double)cpuDelta / 1000000000.0) /
-        timeDelta *
-        100.0;
+    return ((double)cpuDifference / 1000000000.0) /
+           timeDifference * 100.0;
 }
 
-static NSUInteger BHFGetThreadCount(void)
+static NSUInteger BHFThreads(void)
 {
-    task_t task = mach_task_self();
-
     thread_act_array_t threads = NULL;
-    mach_msg_type_number_t threadCount = 0;
+    mach_msg_type_number_t count = 0;
 
-    kern_return_t kr =
-        task_threads(
-            task,
-            &threads,
-            &threadCount
-        );
+    kern_return_t result = task_threads(
+        mach_task_self(),
+        &threads,
+        &count
+    );
 
-    if (kr != KERN_SUCCESS)
+    if (result != KERN_SUCCESS)
         return 0;
 
-    NSUInteger result =
-        (NSUInteger)threadCount;
+    NSUInteger number = (NSUInteger)count;
 
     vm_deallocate(
         mach_task_self(),
         (vm_address_t)threads,
-        threadCount * sizeof(thread_act_t)
+        count * sizeof(thread_act_t)
     );
 
-    return result;
+    return number;
 }
 
-static double BHFGetMemoryMB(void)
+static double BHFMemory(void)
 {
-    task_vm_info_data_t vmInfo;
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
 
-    mach_msg_type_number_t count =
-        TASK_VM_INFO_COUNT;
+    kern_return_t result = task_info(
+        mach_task_self(),
+        TASK_VM_INFO,
+        (task_info_t)&info,
+        &count
+    );
 
-    kern_return_t kr =
-        task_info(
-            mach_task_self(),
-            TASK_VM_INFO,
-            (task_info_t)&vmInfo,
-            &count
-        );
-
-    if (kr != KERN_SUCCESS)
+    if (result != KERN_SUCCESS)
         return -1.0;
 
-    return
-        (double)vmInfo.phys_footprint /
-        (1024.0 * 1024.0);
+    return (double)info.phys_footprint /
+           (1024.0 * 1024.0);
 }
 
-static UILabel *BHFOverlayLabel = nil;
-static NSTimer *BHFMonitorTimer = nil;
-
-static void BHFUpdateOverlay(void)
+static UIWindow *BHFWindow(void)
 {
-    if (!BHFOverlayLabel)
+    UIApplication *application =
+        [UIApplication sharedApplication];
+
+    if (@available(iOS 13.0, *))
+    {
+        for (UIScene *scene in application.connectedScenes)
+        {
+            if (scene.activationState !=
+                UISceneActivationStateForegroundActive)
+            {
+                continue;
+            }
+
+            if (![scene isKindOfClass:[UIWindowScene class]])
+                continue;
+
+            UIWindowScene *windowScene =
+                (UIWindowScene *)scene;
+
+            for (UIWindow *window in windowScene.windows)
+            {
+                if (window.isKeyWindow)
+                    return window;
+            }
+
+            if (windowScene.windows.count > 0)
+                return windowScene.windows.firstObject;
+        }
+    }
+
+    return nil;
+}
+
+static void BHFUpdate(void)
+{
+    if (BHFLabel == nil)
         return;
 
-    double cpu =
-        BHFGetCPUUsage();
+    double cpu = BHFCPU();
+    NSUInteger threads = BHFThreads();
+    double memory = BHFMemory();
 
-    NSUInteger threads =
-        BHFGetThreadCount();
-
-    double memory =
-        BHFGetMemoryMB();
-
-    NSString *cpuText;
-
-    if (cpu < 0.0)
-    {
-        cpuText =
-            @"CPU: unavailable";
-    }
-    else
-    {
-        cpuText =
-            [NSString stringWithFormat:
-                @"CPU: %.1f%%",
-                cpu];
-    }
-
-    NSString *memoryText;
-
-    if (memory < 0.0)
-    {
-        memoryText =
-            @"Memory: unavailable";
-    }
-    else
-    {
-        memoryText =
-            [NSString stringWithFormat:
-                @"Memory: %.0f MB",
-                memory];
-    }
-
-    BHFOverlayLabel.text =
-        [NSString stringWithFormat:
-            @"BumbleHeatFix\n"
-             "CPU MONITOR\n\n"
-             "Dylib: LOADED\n"
-             "%@\n"
-             "Threads: %lu\n"
-             "%@",
-             cpuText,
-             (unsigned long)threads,
-             memoryText];
+    BHFLabel.text = [NSString stringWithFormat:
+        @"BumbleHeatFix\n"
+         "CPU MONITOR\n\n"
+         "Dylib: LOADED\n"
+         "CPU: %.1f%%\n"
+         "Threads: %lu\n"
+         "Memory: %.0f MB",
+         cpu,
+         (unsigned long)threads,
+         memory
+    ];
 
     BHFLog(
         @"CPU %.1f%% | Threads %lu | Memory %.0f MB",
@@ -192,67 +174,19 @@ static void BHFUpdateOverlay(void)
     );
 }
 
-static UIWindow *BHFFindWindow(void)
-{
-    UIApplication *application =
-        [UIApplication sharedApplication];
-
-    if (@available(iOS 13.0, *))
-    {
-        NSSet<UIScene *> *scenes =
-            application.connectedScenes;
-
-        for (UIScene *scene in scenes)
-        {
-            if (scene.activationState !=
-                UISceneActivationStateForegroundActive)
-            {
-                continue;
-            }
-
-            if (![scene isKindOfClass:
-                    [UIWindowScene class]])
-            {
-                continue;
-            }
-
-            UIWindowScene *windowScene =
-                (UIWindowScene *)scene;
-
-            for (UIWindow *window in windowScene.windows)
-            {
-                if (window.isKeyWindow)
-                {
-                    return window;
-                }
-            }
-
-            if (windowScene.windows.count > 0)
-            {
-                return windowScene.windows.firstObject;
-            }
-        }
-    }
-
-    return nil;
-}
-
 static void BHFCreateOverlay(void)
 {
     dispatch_async(
         dispatch_get_main_queue(),
         ^{
-            if (BHFOverlayLabel)
+            if (BHFLabel != nil)
                 return;
 
-            UIWindow *window =
-                BHFFindWindow();
+            UIWindow *window = BHFWindow();
 
-            if (!window)
+            if (window == nil)
             {
-                BHFLog(
-                    @"Could not find foreground window"
-                );
+                BHFLog(@"Window not found");
 
                 dispatch_after(
                     dispatch_time(
@@ -268,65 +202,56 @@ static void BHFCreateOverlay(void)
                 return;
             }
 
-            BHFOverlayLabel =
-                [[UILabel alloc]
-                    initWithFrame:
-                        CGRectMake(
-                            15,
-                            80,
-                            280,
-                            170
-                        )];
+            BHFLabel = [[UILabel alloc]
+                initWithFrame:CGRectMake(
+                    15,
+                    80,
+                    280,
+                    170
+                )
+            ];
 
-            BHFOverlayLabel.numberOfLines = 0;
+            BHFLabel.numberOfLines = 0;
 
-            BHFOverlayLabel.text =
-                @"BumbleHeatFix\n"
-                 "CPU MONITOR\n\n"
-                 "Dylib: LOADED\n"
-                 "Starting monitor...";
-
-            BHFOverlayLabel.textColor =
+            BHFLabel.textColor =
                 [UIColor whiteColor];
 
-            BHFOverlayLabel.backgroundColor =
+            BHFLabel.backgroundColor =
                 [[UIColor blackColor]
                     colorWithAlphaComponent:0.80];
 
-            BHFOverlayLabel.font =
-                [UIFont monospacedSystemFontOfSize:
-                    13.0
-                    weight:UIFontWeightRegular];
+            BHFLabel.font =
+                [UIFont monospacedSystemFontOfSize:13.0
+                                            weight:UIFontWeightRegular];
 
-            BHFOverlayLabel.textAlignment =
+            BHFLabel.layer.cornerRadius = 10.0;
+            BHFLabel.layer.masksToBounds = YES;
+
+            BHFLabel.textAlignment =
                 NSTextAlignmentLeft;
 
-            BHFOverlayLabel.layer.cornerRadius =
-                10.0;
+            BHFLabel.userInteractionEnabled = NO;
 
-            BHFOverlayLabel.layer.masksToBounds =
-                YES;
+            BHFLabel.text =
+                @"BumbleHeatFix\n"
+                 "CPU MONITOR\n\n"
+                 "Dylib: LOADED\n"
+                 "Starting...";
 
-            BHFOverlayLabel.userInteractionEnabled =
-                NO;
+            [window addSubview:BHFLabel];
 
-            [window addSubview:BHFOverlayLabel];
+            BHFLog(@"Overlay created");
 
-            BHFLog(
-                @"CPU monitoring overlay created"
-            );
+            BHFUpdate();
 
-            BHFUpdateOverlay();
-
-            BHFMonitorTimer =
-                [NSTimer scheduledTimerWithTimeInterval:
-                    1.0
-                    repeats:YES
-                    block:
-                    ^(NSTimer *timer)
-                    {
-                        BHFUpdateOverlay();
-                    }];
+            BHFTimer =
+                [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                 repeats:YES
+                                                   block:
+                ^(NSTimer *timer)
+                {
+                    BHFUpdate();
+                }];
         }
     );
 }
@@ -335,29 +260,17 @@ static void BHFCreateOverlay(void)
 {
     @autoreleasepool
     {
-        BHFLog(
-            @"================================"
-        );
-
-        BHFLog(
-            @"BumbleHeatFix CPU monitor loaded"
-        );
-
+        BHFLog(@"================================");
+        BHFLog(@"BumbleHeatFix CPU monitor loaded");
         BHFLog(
             @"Process: %@",
-            [[NSProcessInfo processInfo]
-                processName]
+            [[NSProcessInfo processInfo] processName]
         );
-
         BHFLog(
             @"iOS: %@",
-            [[UIDevice currentDevice]
-                systemVersion]
+            [[UIDevice currentDevice] systemVersion]
         );
-
-        BHFLog(
-            @"================================"
-        );
+        BHFLog(@"================================");
 
         dispatch_after(
             dispatch_time(
