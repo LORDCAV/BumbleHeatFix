@@ -1,26 +1,11 @@
-name: BumbleHeatFix Build
+name: Test BumbleHeatFix
 
-"on":
+on:
 workflow_dispatch:
 
 jobs:
-build:
+test:
 runs-on: macos-14
 steps:
-- uses: actions/checkout@v4
-
-```
-  - run: git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
-
-  - run: brew install ldid-procursus
-
-  - run: |
-      export THEOS="$HOME/theos"
-      make clean
-      make package FINALPACKAGE=1
-
-  - uses: actions/upload-artifact@v4
-    with:
-      name: BumbleHeatFix-dylib
-      path: .theos/_/Library/MobileSubstrate/DynamicLibraries/
-```
+- name: Test
+run: echo "YAML WORKS"
