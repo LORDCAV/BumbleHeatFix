@@ -1,16 +1,16 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
 #import <mach/thread_info.h>
 #import <mach/task_info.h>
 #import <pthread.h>
 #import <unistd.h>
+#import <stdarg.h>
 
 #pragma mark - Configuration
 
 #define BHF_SAMPLE_INTERVAL 1.0
-#define BHF_MAX_THREADS 32
-#define BHF_HISTORY_COUNT 10
 
 #pragma mark - Logging
 
@@ -27,22 +27,7 @@ static void BHFLog(NSString *format, ...)
     NSLog(@"[BumbleHeatFix] %@", message);
 }
 
-#pragma mark - Thread Information
-
-typedef struct {
-    uint32_t threadID;
-    double cpu;
-    uint64_t userTime;
-    uint64_t systemTime;
-} BHFThreadSample;
-
-static uint64_t BHFAbsoluteTimeToNanoseconds(uint64_t time)
-{
-    mach_timebase_info_data_t timebase;
-    mach_timebase_info(&timebase);
-
-    return (time * timebase.numer) / timebase.denom;
-}
+#pragma mark - CPU
 
 static double BHFThreadCPUUsage(thread_act_t thread)
 {
@@ -64,37 +49,30 @@ static double BHFThreadCPUUsage(thread_act_t thread)
         return 0.0;
 
     /*
-     * thread_basic_info.cpu_usage is scaled by TH_USAGE_SCALE.
-     *
-     * 100% approximately represents one fully utilized CPU core.
+     * 100% approximately represents one fully
+     * utilized CPU core.
      */
-    return ((double)info.cpu_usage * 100.0) / (double)TH_USAGE_SCALE;
+    return ((double)info.cpu_usage * 100.0)
+        / (double)TH_USAGE_SCALE;
 }
+
+#pragma mark - Thread Name
 
 static NSString *BHFThreadName(thread_act_t thread)
 {
     /*
-     * Mach thread ports don't directly expose pthread names.
+     * A Mach thread port cannot safely be converted
+     * into a pthread_t for pthread_getname_np().
      *
-     * We therefore attempt to obtain a useful description from
-     * the thread's Mach port ID.
-     *
-     * If no pthread name is available, we report it as unnamed.
+     * Therefore, unnamed Mach threads are reported
+     * as <unnamed>.
      */
-
-    char name[64];
-    memset(name, 0, sizeof(name));
-
-    /*
-     * pthread_getname_np() requires a pthread_t rather than a
-     * Mach thread port, so it cannot safely be used to translate
-     * arbitrary Mach threads.
-     */
+    (void)thread;
 
     return @"<unnamed>";
 }
 
-#pragma mark - CPU Sampler
+#pragma mark - Thread Collection
 
 static void BHFCollectThreads(void)
 {
@@ -110,8 +88,13 @@ static void BHFCollectThreads(void)
             &threadCount
         );
 
-    if (kr != KERN_SUCCESS) {
-        BHFLog(@"task_threads failed: %d", kr);
+    if (kr != KERN_SUCCESS)
+    {
+        BHFLog(
+            @"task_threads failed: %d",
+            kr
+        );
+
         return;
     }
 
@@ -136,20 +119,25 @@ static void BHFCollectThreads(void)
                 &identifierCount
             );
 
-        uint64_t threadID = 0;
+        uint64_t threadID;
 
-        if (identifierKR == KERN_SUCCESS) {
+        if (identifierKR == KERN_SUCCESS)
+        {
             threadID = identifierInfo.thread_id;
-        } else {
+        }
+        else
+        {
             threadID = (uint64_t)thread;
         }
 
-        double cpu = BHFThreadCPUUsage(thread);
+        double cpu =
+            BHFThreadCPUUsage(thread);
 
         if (cpu < 0.0)
             continue;
 
-        NSString *name = BHFThreadName(thread);
+        NSString *name =
+            BHFThreadName(thread);
 
         NSDictionary *sample = @{
             @"tid": @(threadID),
@@ -161,14 +149,17 @@ static void BHFCollectThreads(void)
     }
 
     /*
-     * Sort highest CPU first.
+     * Sort from highest CPU to lowest CPU.
      */
     [samples sortUsingComparator:^NSComparisonResult(
         NSDictionary *a,
         NSDictionary *b
     ) {
-        double cpuA = [a[@"cpu"] doubleValue];
-        double cpuB = [b[@"cpu"] doubleValue];
+        double cpuA =
+            [a[@"cpu"] doubleValue];
+
+        double cpuB =
+            [b[@"cpu"] doubleValue];
 
         if (cpuA > cpuB)
             return NSOrderedAscending;
@@ -180,14 +171,24 @@ static void BHFCollectThreads(void)
     }];
 
     BHFLog(@"----------------------------------------");
-    BHFLog(@"THREAD SAMPLE — %lu threads",
-           (unsigned long)samples.count);
 
-    NSUInteger displayCount = MIN((NSUInteger)8, samples.count);
+    BHFLog(
+        @"THREAD SAMPLE — %lu threads",
+        (unsigned long)samples.count
+    );
 
-    for (NSUInteger i = 0; i < displayCount; i++)
+    /*
+     * Print the top 8 threads.
+     */
+    NSUInteger displayCount =
+        MIN((NSUInteger)8, samples.count);
+
+    for (NSUInteger i = 0;
+         i < displayCount;
+         i++)
     {
-        NSDictionary *sample = samples[i];
+        NSDictionary *sample =
+            samples[i];
 
         BHFLog(
             @"#%lu  TID=%@  CPU=%.1f%%  %@",
@@ -199,18 +200,20 @@ static void BHFCollectThreads(void)
     }
 
     /*
-     * Highlight a potentially persistent hot thread.
+     * Highlight the hottest thread.
      */
     if (samples.count > 0)
     {
-        NSDictionary *top = samples[0];
+        NSDictionary *top =
+            samples[0];
 
-        double topCPU = [top[@"cpu"] doubleValue];
+        double topCPU =
+            [top[@"cpu"] doubleValue];
 
         if (topCPU >= 80.0)
         {
             BHFLog(
-                @"🔥 HIGH CPU THREAD: TID=%@ CPU=%.1f%%",
+                @"HIGH CPU THREAD: TID=%@ CPU=%.1f%%",
                 top[@"tid"],
                 topCPU
             );
@@ -219,7 +222,7 @@ static void BHFCollectThreads(void)
         if (topCPU >= 95.0)
         {
             BHFLog(
-                @"⚠️ POSSIBLE FULL-CORE THREAD: TID=%@ CPU=%.1f%%",
+                @"POSSIBLE FULL-CORE THREAD: TID=%@ CPU=%.1f%%",
                 top[@"tid"],
                 topCPU
             );
@@ -227,8 +230,7 @@ static void BHFCollectThreads(void)
     }
 
     /*
-     * task_threads() allocates the thread list.
-     * Release it when finished.
+     * Release the array allocated by task_threads().
      */
     if (threadList != NULL)
     {
@@ -240,12 +242,14 @@ static void BHFCollectThreads(void)
     }
 }
 
-#pragma mark - Memory Sampler
+#pragma mark - Memory
 
 static void BHFCollectMemory(void)
 {
     task_vm_info_data_t vmInfo;
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+    mach_msg_type_number_t count =
+        TASK_VM_INFO_COUNT;
 
     kern_return_t kr =
         task_info(
@@ -259,10 +263,13 @@ static void BHFCollectMemory(void)
         return;
 
     double memoryMB =
-        (double)vmInfo.phys_footprint /
-        (1024.0 * 1024.0);
+        (double)vmInfo.phys_footprint
+        / (1024.0 * 1024.0);
 
-    BHFLog(@"Memory footprint: %.1f MB", memoryMB);
+    BHFLog(
+        @"Memory footprint: %.1f MB",
+        memoryMB
+    );
 }
 
 #pragma mark - Diagnostic Loop
@@ -290,6 +297,7 @@ static void BHFStartDiagnostics(void)
                 );
 
                 BHFCollectThreads();
+
                 BHFCollectMemory();
 
                 BHFLog(
@@ -298,7 +306,8 @@ static void BHFStartDiagnostics(void)
                 );
             }
 
-            [NSThread sleepForTimeInterval:BHF_SAMPLE_INTERVAL];
+            [NSThread sleepForTimeInterval:
+                BHF_SAMPLE_INTERVAL];
         }
     });
 }
@@ -307,96 +316,135 @@ static void BHFStartDiagnostics(void)
 
 static UILabel *BHFOverlayLabel = nil;
 
-static void BHFCreateOverlay(void)
+static UIWindow *BHFFindApplicationWindow(void)
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *targetWindow = nil;
+    UIWindow *targetWindow = nil;
 
-        if (@available(iOS 13.0, *))
+    if (@available(iOS 13.0, *))
+    {
+        NSSet<UIScene *> *scenes =
+            [UIApplication sharedApplication].connectedScenes;
+
+        for (UIScene *scene in scenes)
         {
-            for (UIScene *scene in
-                 [UIApplication sharedApplication].connectedScenes)
+            if (scene.activationState !=
+                UISceneActivationStateForegroundActive)
             {
-                if (scene.activationState !=
-                    UISceneActivationStateForegroundActive)
+                continue;
+            }
+
+            if (![scene isKindOfClass:[UIWindowScene class]])
+            {
+                continue;
+            }
+
+            UIWindowScene *windowScene =
+                (UIWindowScene *)scene;
+
+            for (UIWindow *window in windowScene.windows)
+            {
+                if (window.hidden)
                     continue;
 
-                if (![scene isKindOfClass:[UIWindowScene class]])
+                if (window.alpha <= 0.0)
                     continue;
 
-                UIWindowScene *windowScene =
-                    (UIWindowScene *)scene;
-
-                for (UIWindow *window in windowScene.windows)
+                if (window.windowLevel !=
+                    UIWindowLevelNormal)
                 {
-                    if (window.hidden)
-                        continue;
-
-                    if (window.alpha <= 0.0)
-                        continue;
-
-                    if (window.windowLevel != UIWindowLevelNormal)
-                        continue;
-
-                    targetWindow = window;
-
-                    if (window.isKeyWindow)
-                        break;
+                    continue;
                 }
 
-                if (targetWindow)
-                    break;
+                targetWindow = window;
+
+                if (window.isKeyWindow)
+                    return window;
             }
+
+            if (targetWindow)
+                return targetWindow;
         }
-        else
-        {
+    }
+    else
+    {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            targetWindow =
-                [UIApplication sharedApplication].keyWindow;
+
+        targetWindow =
+            [UIApplication sharedApplication].keyWindow;
+
 #pragma clang diagnostic pop
+    }
+
+    return targetWindow;
+}
+
+static void BHFCreateOverlay(void)
+{
+    dispatch_async(
+        dispatch_get_main_queue(),
+        ^{
+            UIWindow *targetWindow =
+                BHFFindApplicationWindow();
+
+            if (!targetWindow)
+            {
+                BHFLog(
+                    @"Could not find application window"
+                );
+
+                return;
+            }
+
+            if (BHFOverlayLabel)
+            {
+                [BHFOverlayLabel removeFromSuperview];
+                BHFOverlayLabel = nil;
+            }
+
+            UILabel *label =
+                [[UILabel alloc]
+                    initWithFrame:
+                        CGRectMake(
+                            8,
+                            50,
+                            280,
+                            120
+                        )];
+
+            label.numberOfLines = 0;
+
+            label.font =
+                [UIFont monospacedSystemFontOfSize:
+                    11.0
+                    weight:UIFontWeightMedium];
+
+            label.textColor =
+                UIColor.whiteColor;
+
+            label.backgroundColor =
+                [[UIColor blackColor]
+                    colorWithAlphaComponent:0.78];
+
+            label.layer.cornerRadius = 8.0;
+            label.layer.masksToBounds = YES;
+
+            label.text =
+                @"BumbleHeatFix v2\n"
+                 "DIAGNOSTIC MODE\n"
+                 "Monitoring CPU threads...\n"
+                 "Sampling every 1 second\n"
+                 "See console/log output.";
+
+            [targetWindow addSubview:label];
+
+            BHFOverlayLabel = label;
+
+            BHFLog(
+                @"Diagnostic overlay created successfully"
+            );
         }
-
-        if (!targetWindow)
-        {
-            BHFLog(@"Could not find application window");
-            return;
-        }
-
-        if (BHFOverlayLabel)
-        {
-            [BHFOverlayLabel removeFromSuperview];
-            BHFOverlayLabel = nil;
-        }
-
-        UILabel *label =
-            [[UILabel alloc] initWithFrame:
-                CGRectMake(8, 50, 250, 115)];
-
-        label.numberOfLines = 0;
-        label.font =
-            [UIFont monospacedSystemFontOfSize:11
-                                        weight:UIFontWeightMedium];
-
-        label.textColor = UIColor.whiteColor;
-        label.backgroundColor =
-            [[UIColor blackColor] colorWithAlphaComponent:0.78];
-
-        label.layer.cornerRadius = 8.0;
-        label.layer.masksToBounds = YES;
-
-        label.text =
-            @"BumbleHeatFix v2\n"
-             "DIAGNOSTIC MODE\n"
-             "Monitoring CPU threads...\n"
-             "Check console logs for details.";
-
-        [targetWindow addSubview:label];
-
-        BHFOverlayLabel = label;
-
-        BHFLog(@"Diagnostic overlay created successfully");
-    });
+    );
 }
 
 #pragma mark - Constructor
@@ -408,13 +456,22 @@ static void BHFCreateOverlay(void)
         BHFLog(@"========================================");
         BHFLog(@"BumbleHeatFix v2 loaded");
         BHFLog(@"DIAGNOSTIC MODE");
-        BHFLog(@"Process: %@",
-               [[NSProcessInfo processInfo] processName]);
-        BHFLog(@"PID: %d", getpid());
-        BHFLog(@"iOS: %@",
-               [[UIDevice currentDevice] systemVersion]);
-        BHFLog(@"Device: %@",
-               [[UIDevice currentDevice] model]);
+        BHFLog(
+            @"Process: %@",
+            [[NSProcessInfo processInfo] processName]
+        );
+        BHFLog(
+            @"PID: %d",
+            getpid()
+        );
+        BHFLog(
+            @"iOS: %@",
+            [[UIDevice currentDevice] systemVersion]
+        );
+        BHFLog(
+            @"Device: %@",
+            [[UIDevice currentDevice] model]
+        );
         BHFLog(@"========================================");
 
         dispatch_after(
