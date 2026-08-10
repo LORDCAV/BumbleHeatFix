@@ -1,258 +1,224 @@
-
+```objc
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
+#import <mach/mach_host.h>
 #import <pthread.h>
 
-static UIWindow *BHFWindow = nil;
 static UILabel *BHFLabel = nil;
+static NSTimer *BHFUpdateTimer = nil;
+static uint64_t BHFPreviousCPUTime = 0;
+static CFTimeInterval BHFPreviousTime = 0;
+
+static void BHFUpdateOverlay(NSString *text);
 
 static UIWindow *BHFGetWindow(void)
 {
-    UIApplication *application = [UIApplication sharedApplication];
+    UIWindow *result = nil;
 
-    for (UIScene *scene in application.connectedScenes) {
-        if (scene.activationState != UISceneActivationStateForegroundActive) {
-            continue;
-        }
-
-        if (![scene isKindOfClass:[UIWindowScene class]]) {
-            continue;
-        }
-
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-
-        for (UIWindow *window in windowScene.windows) {
-            if (window.hidden) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) {
                 continue;
             }
 
-            if (window.alpha <= 0.0) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
                 continue;
             }
 
-            if (window.windowLevel != UIWindowLevelNormal) {
-                continue;
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+
+            for (UIWindow *window in windowScene.windows) {
+                if (window.isKeyWindow) {
+                    result = window;
+                    break;
+                }
             }
 
-            return window;
+            if (result == nil && windowScene.windows.count > 0) {
+                result = windowScene.windows.firstObject;
+            }
+
+            if (result != nil) {
+                break;
+            }
         }
     }
 
-    return nil;
+    return result;
+}
+
+static double BHFProcessCPUTime(void)
+{
+    task_thread_times_info_data_t taskInfo;
+    mach_msg_type_number_t count = TASK_THREAD_TIMES_INFO_COUNT;
+
+    kern_return_t kr = task_info(
+        mach_task_self(),
+        TASK_THREAD_TIMES_INFO,
+        (task_info_t)&taskInfo,
+        &count
+    );
+
+    if (kr != KERN_SUCCESS) {
+        return 0.0;
+    }
+
+    uint64_t user =
+        ((uint64_t)taskInfo.user_time.seconds * 1000000000ULL) +
+        taskInfo.user_time.microseconds * 1000ULL;
+
+    uint64_t system =
+        ((uint64_t)taskInfo.system_time.seconds * 1000000000ULL) +
+        taskInfo.system_time.microseconds * 1000ULL;
+
+    return (double)(user + system) / 1000000000.0;
+}
+
+static NSUInteger BHFThreadCount(void)
+{
+    thread_act_array_t threadList = NULL;
+    mach_msg_type_number_t threadCount = 0;
+
+    kern_return_t kr = task_threads(
+        mach_task_self(),
+        &threadList,
+        &threadCount
+    );
+
+    if (kr != KERN_SUCCESS) {
+        return 0;
+    }
+
+    if (threadList != NULL) {
+        vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)threadList,
+            threadCount * sizeof(thread_t)
+        );
+    }
+
+    return (NSUInteger)threadCount;
+}
+
+static NSUInteger BHFMemoryMB(void)
+{
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+    kern_return_t kr = task_info(
+        mach_task_self(),
+        TASK_VM_INFO,
+        (task_info_t)&vmInfo,
+        &count
+    );
+
+    if (kr != KERN_SUCCESS) {
+        return 0;
+    }
+
+    uint64_t physicalFootprint = vmInfo.phys_footprint;
+
+    return (NSUInteger)(physicalFootprint / (1024ULL * 1024ULL));
 }
 
 static void BHFCreateOverlay(void)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (BHFWindow != nil) {
+        if (BHFLabel != nil) {
             return;
         }
 
-        UIWindow *targetWindow = BHFGetWindow();
+        UIWindow *window = BHFGetWindow();
 
-        if (targetWindow == nil) {
+        if (window == nil) {
             return;
         }
 
-        BHFWindow = [[UIWindow alloc]
-            initWithFrame:CGRectMake(8.0, 50.0, 300.0, 190.0)];
-
-        BHFWindow.windowLevel = UIWindowLevelAlert + 100.0;
-        BHFWindow.backgroundColor =
-            [UIColor colorWithWhite:0.0 alpha:0.85];
-
-        BHFWindow.userInteractionEnabled = NO;
-        BHFWindow.hidden = NO;
-
-        BHFLabel = [[UILabel alloc]
-            initWithFrame:BHFWindow.bounds];
+        BHFLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 60, 300, 130)];
 
         BHFLabel.numberOfLines = 0;
-
-        BHFLabel.textColor = [UIColor whiteColor];
-
-        BHFLabel.font =
-            [UIFont monospacedSystemFontOfSize:11.0
-                                        weight:UIFontWeightRegular];
-
         BHFLabel.textAlignment = NSTextAlignmentLeft;
+        BHFLabel.font = [UIFont monospacedSystemFontOfSize:13.0 weight:UIFontWeightMedium];
+        BHFLabel.textColor = [UIColor whiteColor];
+        BHFLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
+        BHFLabel.layer.cornerRadius = 8.0;
+        BHFLabel.layer.masksToBounds = YES;
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "THREAD MONITOR\n"
+             "MONITOR TEST\n\n"
              "Dylib: LOADED\n"
-             "Reading threads...";
+             "Overlay: WORKING";
 
-        [BHFWindow addSubview:BHFLabel];
+        [window addSubview:BHFLabel];
     });
-}
-
-static NSString *BHFGetThreadName(thread_t thread)
-{
-    char name[64];
-
-    memset(name, 0, sizeof(name));
-
-    pthread_t pthreadID =
-        pthread_from_mach_thread_np(thread);
-
-    if (pthreadID != NULL) {
-        int result =
-            pthread_getname_np(
-                pthreadID,
-                name,
-                sizeof(name)
-            );
-
-        if (result == 0 && name[0] != '\0') {
-            return [NSString stringWithUTF8String:name];
-        }
-    }
-
-    return @"<unnamed>";
-}
-
-static void BHFReadThreads(void)
-{
-    mach_port_t task = mach_task_self();
-
-    thread_act_array_t threads = NULL;
-
-    mach_msg_type_number_t threadCount = 0;
-
-    kern_return_t result =
-        task_threads(
-            task,
-            &threads,
-            &threadCount
-        );
-
-    if (result != KERN_SUCCESS ||
-        threads == NULL ||
-        threadCount == 0) {
-
-        BHFUpdateOverlay(
-            @"BumbleHeatFix\n"
-             "THREAD MONITOR\n"
-             "Unable to read threads"
-        );
-
-        return;
-    }
-
-    NSMutableString *output =
-        [NSMutableString stringWithFormat:
-            @"BumbleHeatFix\n"
-             "THREAD MONITOR\n"
-             "Threads: %u\n\n",
-             threadCount];
-
-    mach_msg_type_number_t displayed = 0;
-
-    for (mach_msg_type_number_t i = 0;
-         i < threadCount && displayed < 8;
-         i++) {
-
-        thread_basic_info_data_t info;
-
-        mach_msg_type_number_t infoCount =
-            THREAD_BASIC_INFO_COUNT;
-
-        kern_return_t infoResult =
-            thread_info(
-                threads[i],
-                THREAD_BASIC_INFO,
-                (thread_info_t)&info,
-                &infoCount
-            );
-
-        if (infoResult != KERN_SUCCESS) {
-            continue;
-        }
-
-        NSString *name =
-            BHFGetThreadName(threads[i]);
-
-        [output appendFormat:
-            @"%u. %@\n",
-            displayed + 1,
-            name];
-
-        displayed++;
-    }
-
-    if (displayed == 0) {
-        [output appendString:@"No readable threads"];
-    }
-
-    BHFUpdateOverlay(output);
-
-    vm_deallocate(
-        mach_task_self(),
-        (vm_address_t)threads,
-        threadCount * sizeof(thread_t)
-    );
 }
 
 static void BHFUpdateOverlay(NSString *text)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (BHFLabel == nil) {
+            BHFCreateOverlay();
+        }
+
         if (BHFLabel != nil) {
             BHFLabel.text = text;
         }
     });
 }
 
+static void BHFCollectStats(void)
+{
+    double currentCPUTime = BHFProcessCPUTime();
+    CFTimeInterval currentTime = CACurrentMediaTime();
+
+    double cpuDelta = 0.0;
+
+    if (BHFPreviousTime > 0.0 && currentTime > BHFPreviousTime) {
+        cpuDelta = currentCPUTime - BHFPreviousCPUTime;
+    }
+
+    BHFPreviousCPUTime = (uint64_t)(currentCPUTime * 1000000000.0);
+    BHFPreviousTime = currentTime;
+
+    NSUInteger threads = BHFThreadCount();
+    NSUInteger memory = BHFMemoryMB();
+
+    NSString *output = [NSString stringWithFormat:
+        @"BumbleHeatFix\n"
+         "CPU time: %.2fs\n"
+         "CPU Δ/1s: %.2fs\n"
+         "Threads: %lu\n"
+         "Memory: %lu MB",
+        currentCPUTime,
+        cpuDelta,
+        (unsigned long)threads,
+        (unsigned long)memory
+    ];
+
+    BHFUpdateOverlay(output);
+}
+
 %ctor
 {
     @autoreleasepool {
-
-        NSLog(
-            @"[BumbleHeatFix] Thread monitor loaded"
-        );
+        NSLog(@"[BumbleHeatFix] Loaded successfully");
 
         dispatch_after(
-            dispatch_time(
-                DISPATCH_TIME_NOW,
-                2 * NSEC_PER_SEC
-            ),
+            dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
             dispatch_get_main_queue(),
             ^{
                 BHFCreateOverlay();
+
+                BHFUpdateTimer =
+                    [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                     repeats:YES
+                                                       block:^(NSTimer *timer) {
+                    BHFCollectStats();
+                }];
             }
         );
-
-        dispatch_source_t timer =
-            dispatch_source_create(
-                DISPATCH_SOURCE_TYPE_TIMER,
-                0,
-                0,
-                dispatch_get_main_queue()
-            );
-
-        if (timer != NULL) {
-
-            dispatch_source_set_timer(
-                timer,
-                dispatch_time(
-                    DISPATCH_TIME_NOW,
-                    3 * NSEC_PER_SEC
-                ),
-                1 * NSEC_PER_SEC,
-                100 * NSEC_PER_MSEC
-            );
-
-            dispatch_source_set_event_handler(
-                timer,
-                ^{
-                    BHFCreateOverlay();
-                    BHFReadThreads();
-                }
-            );
-
-            dispatch_resume(timer);
-        }
     }
 }
 ```
