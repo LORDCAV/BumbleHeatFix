@@ -1,29 +1,26 @@
-name: Build BumbleHeatFix dylib
+name: BumbleHeatFix Build
+
 "on":
-push:
-branches:
-- main
 workflow_dispatch:
+
 jobs:
 build:
 runs-on: macos-14
 steps:
-- name: Checkout
-uses: actions/checkout@v4
-- name: Install Theos
-run: git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
-- name: Install ldid
-run: brew install ldid-procursus
-- name: Build
-run: |
-export THEOS="$HOME/theos"
-make clean
-make package FINALPACKAGE=1
-- name: Upload dylib
-uses: actions/upload-artifact@v4
-with:
-name: BumbleHeatFix-dylib
-path: |
-.theos/*/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib
-.theos/*/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist
-if-no-files-found: error
+- uses: actions/checkout@v4
+
+```
+  - run: git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+
+  - run: brew install ldid-procursus
+
+  - run: |
+      export THEOS="$HOME/theos"
+      make clean
+      make package FINALPACKAGE=1
+
+  - uses: actions/upload-artifact@v4
+    with:
+      name: BumbleHeatFix-dylib
+      path: .theos/_/Library/MobileSubstrate/DynamicLibraries/
+```
