@@ -1,6 +1,6 @@
 name: Build BumbleHeatFix dylib
 
-on:
+"on":
 push:
 branches:
 - main
@@ -15,35 +15,51 @@ steps:
     uses: actions/checkout@v4
 
   - name: Install Theos
-    run: |
-      git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+    run: git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
 
   - name: Install ldid
-    run: |
-      brew install ldid-procursus
+    run: brew install ldid-procursus
 
-  - name: Build dylib
+  - name: Build BumbleHeatFix
     run: |
       export THEOS="$HOME/theos"
       make clean
       make package FINALPACKAGE=1
 
-  - name: Verify dylib
+  - name: Find built files
     run: |
-      echo "=== DYLIB ==="
-      find .theos -type f -name "BumbleHeatFix.dylib" -print
+      echo "=== BumbleHeatFix.dylib ==="
+      find .theos -name "BumbleHeatFix.dylib" -type f -print
 
-      echo "=== PLIST ==="
-      find .theos -type f -name "BumbleHeatFix.plist" -print
+      echo "=== BumbleHeatFix.plist ==="
+      find .theos -name "BumbleHeatFix.plist" -type f -print
 
-      echo "=== PACKAGE ==="
-      find packages -type f -name "*.deb" -print 2>/dev/null || true
+  - name: Prepare dylib files
+    run: |
+      mkdir -p output
 
-  - name: Upload dylib and plist
+      DYLIB=$(find .theos -name "BumbleHeatFix.dylib" -type f | head -n 1)
+      PLIST=$(find .theos -name "BumbleHeatFix.plist" -type f | head -n 1)
+
+      if [ -z "$DYLIB" ]; then
+        echo "ERROR: BumbleHeatFix.dylib was not found"
+        exit 1
+      fi
+
+      if [ -z "$PLIST" ]; then
+        echo "ERROR: BumbleHeatFix.plist was not found"
+        exit 1
+      fi
+
+      cp "$DYLIB" output/BumbleHeatFix.dylib
+      cp "$PLIST" output/BumbleHeatFix.plist
+
+      echo "=== OUTPUT ==="
+      ls -lh output/
+
+  - name: Upload BumbleHeatFix dylib
     uses: actions/upload-artifact@v4
     with:
       name: BumbleHeatFix-dylib
-      path: |
-        .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib
-        .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist
+      path: output/
       if-no-files-found: error
