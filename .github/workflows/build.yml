@@ -10,6 +10,7 @@ jobs:
 build:
 runs-on: macos-14
 
+```
 steps:
   - name: Checkout repository
     uses: actions/checkout@v4
@@ -63,3 +64,4 @@ steps:
       name: BumbleHeatFix-dylib
       path: output/
       if-no-files-found: error
+```
