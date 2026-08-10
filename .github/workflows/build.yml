@@ -1,10 +1,10 @@
 name: Build BumbleHeatFix
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
-  workflow_dispatch:
 
 jobs:
   build:
@@ -25,9 +25,10 @@ jobs:
       - name: Build tweak
         run: |
           export THEOS="$HOME/theos"
+          make clean || true
           make package FINALPACKAGE=1
 
-      - name: Show built files
+      - name: Show build output
         run: |
           echo "=== Packages ==="
           find packages -type f -print 2>/dev/null || true
@@ -35,13 +36,27 @@ jobs:
           echo "=== Dylibs ==="
           find .theos -type f -name "*.dylib" -print 2>/dev/null || true
 
-          echo "=== STAGED FILES ==="
-          find .theos/_/Library/MobileSubstrate/DynamicLibraries -type f -print 2>/dev/null || true
+          echo "=== Staged files ==="
+          find .theos/_ -type f -print 2>/dev/null || true
+
+      - name: Prepare dylib artifact
+        run: |
+          mkdir -p artifact
+
+          cp .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib \
+             artifact/BumbleHeatFix.dylib
+
+          cp .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist \
+             artifact/BumbleHeatFix.plist
+
+          echo "=== Artifact contents ==="
+          ls -lh artifact/
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: BumbleHeatFix-dylib
-          path: |
-            .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib
-            .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist
+          path: artifact/*
+          if-no-files-found: error
+          compression-level: 6
+          overwrite: true
