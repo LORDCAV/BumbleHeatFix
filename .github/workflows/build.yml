@@ -1,11 +1,39 @@
-name: Test BumbleHeatFix
+name: Build BumbleHeatFix
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  build:
     runs-on: macos-14
+
     steps:
-      - name: Test
-        run: echo "YAML WORKS"
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ldid
+          brew install make
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+
+      - name: Build BumbleHeatFix
+        run: |
+          export THEOS="$HOME/theos"
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BumbleHeatFix-package
+          path: packages/*.deb
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: BumbleHeatFix-dylib
+          path: .theos/obj/*.dylib
