@@ -1,67 +1,29 @@
 name: Build BumbleHeatFix dylib
-
 "on":
 push:
 branches:
 - main
 workflow_dispatch:
-
 jobs:
 build:
 runs-on: macos-14
-
-```
 steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
-
-  - name: Install Theos
-    run: git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
-
-  - name: Install ldid
-    run: brew install ldid-procursus
-
-  - name: Build BumbleHeatFix
-    run: |
-      export THEOS="$HOME/theos"
-      make clean
-      make package FINALPACKAGE=1
-
-  - name: Find built files
-    run: |
-      echo "=== BumbleHeatFix.dylib ==="
-      find .theos -name "BumbleHeatFix.dylib" -type f -print
-
-      echo "=== BumbleHeatFix.plist ==="
-      find .theos -name "BumbleHeatFix.plist" -type f -print
-
-  - name: Prepare dylib files
-    run: |
-      mkdir -p output
-
-      DYLIB=$(find .theos -name "BumbleHeatFix.dylib" -type f | head -n 1)
-      PLIST=$(find .theos -name "BumbleHeatFix.plist" -type f | head -n 1)
-
-      if [ -z "$DYLIB" ]; then
-        echo "ERROR: BumbleHeatFix.dylib was not found"
-        exit 1
-      fi
-
-      if [ -z "$PLIST" ]; then
-        echo "ERROR: BumbleHeatFix.plist was not found"
-        exit 1
-      fi
-
-      cp "$DYLIB" output/BumbleHeatFix.dylib
-      cp "$PLIST" output/BumbleHeatFix.plist
-
-      echo "=== OUTPUT ==="
-      ls -lh output/
-
-  - name: Upload BumbleHeatFix dylib
-    uses: actions/upload-artifact@v4
-    with:
-      name: BumbleHeatFix-dylib
-      path: output/
-      if-no-files-found: error
-```
+- name: Checkout
+uses: actions/checkout@v4
+- name: Install Theos
+run: git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+- name: Install ldid
+run: brew install ldid-procursus
+- name: Build
+run: |
+export THEOS="$HOME/theos"
+make clean
+make package FINALPACKAGE=1
+- name: Upload dylib
+uses: actions/upload-artifact@v4
+with:
+name: BumbleHeatFix-dylib
+path: |
+.theos/*/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib
+.theos/*/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist
+if-no-files-found: error
