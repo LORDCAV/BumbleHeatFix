@@ -1,6 +1,6 @@
 name: Test BumbleHeatFix
 
-"on":
+on:
   workflow_dispatch:
 
 jobs:
