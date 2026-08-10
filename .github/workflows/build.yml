@@ -1,11 +1,11 @@
 name: Test BumbleHeatFix
 
-on:
-workflow_dispatch:
+"on":
+  workflow_dispatch:
 
 jobs:
-test:
-runs-on: macos-14
-steps:
-- name: Test
-run: echo "YAML WORKS"
+  test:
+    runs-on: macos-14
+    steps:
+      - name: Test
+        run: echo "YAML WORKS"
