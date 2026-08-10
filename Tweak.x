@@ -1,548 +1,308 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
-#import <mach/task.h>
-#import <mach/thread_act.h>
 #import <mach/mach_time.h>
+#import <pthread.h>
 
-static UIWindow *BHFOverlayWindow = nil;
-static UILabel *BHFLabel = nil;
-
-#define BHF_MAX_THREADS 128
-
-typedef struct {
-    uint32_t tid;
-    double cpu;
-} BHFThreadUsage;
-
-static uint64_t BHFNow(void)
+static void BHFLog(NSString *format, ...)
 {
-    return mach_absolute_time();
+    va_list args;
+    va_start(args, format);
+
+    NSString *message =
+        [[NSString alloc] initWithFormat:format arguments:args];
+
+    va_end(args);
+
+    NSLog(@"[BumbleHeatFix] %@", message);
 }
 
-static double BHFSecondsFromAbsolute(uint64_t value)
+static UIWindow *BHFGetWindow(void)
 {
-    mach_timebase_info_data_t timebase;
-    mach_timebase_info(&timebase);
+    UIApplication *application = [UIApplication sharedApplication];
 
-    double nanos =
-        (double)value *
-        (double)timebase.numer /
-        (double)timebase.denom;
+    if (@available(iOS 13.0, *))
+    {
+        for (UIScene *scene in application.connectedScenes)
+        {
+            if (scene.activationState == UISceneActivationStateForegroundActive ||
+                scene.activationState == UISceneActivationStateForegroundInactive)
+            {
+                if ([scene isKindOfClass:[UIWindowScene class]])
+                {
+                    UIWindowScene *windowScene = (UIWindowScene *)scene;
 
-    return nanos / 1000000000.0;
-}
+                    for (UIWindow *window in windowScene.windows)
+                    {
+                        if (window.isKeyWindow)
+                        {
+                            return window;
+                        }
+                    }
 
-static double BHFThreadCPUPercent(
-    thread_t thread,
-    uint64_t previousTime,
-    uint64_t currentTime,
-    uint64_t previousCPU,
-    uint64_t currentCPU)
-{
-    if (previousTime == 0 ||
-        currentTime <= previousTime ||
-        currentCPU < previousCPU) {
-        return 0.0;
+                    for (UIWindow *window in windowScene.windows)
+                    {
+                        if (!window.hidden && window.alpha > 0.0)
+                        {
+                            return window;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    uint64_t elapsedAbsolute =
-        currentTime - previousTime;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-    uint64_t cpuAbsolute =
-        currentCPU - previousCPU;
+    return application.keyWindow;
 
-    double elapsed =
-        BHFSecondsFromAbsolute(elapsedAbsolute);
-
-    double cpu =
-        BHFSecondsFromAbsolute(cpuAbsolute);
-
-    if (elapsed <= 0.0) {
-        return 0.0;
-    }
-
-    return (cpu / elapsed) * 100.0;
+#pragma clang diagnostic pop
 }
 
-static NSUInteger BHFMemoryMB(void)
+static void BHFShowMessage(NSString *message)
 {
-    task_vm_info_data_t info;
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = BHFGetWindow();
 
-    kern_return_t kr = task_info(
-        mach_task_self(),
-        TASK_VM_INFO,
-        (task_info_t)&info,
-        &count
-    );
+        if (!window)
+        {
+            BHFLog(@"Could not find application window");
+            return;
+        }
 
-    if (kr != KERN_SUCCESS) {
+        UILabel *label = [[UILabel alloc] init];
+
+        label.text = message;
+        label.textColor = [UIColor whiteColor];
+        label.backgroundColor =
+            [[UIColor blackColor] colorWithAlphaComponent:0.85];
+
+        label.textAlignment = NSTextAlignmentCenter;
+        label.font = [UIFont systemFontOfSize:13.0
+                                      weight:UIFontWeightSemibold];
+
+        label.numberOfLines = 0;
+        label.layer.cornerRadius = 10.0;
+        label.layer.masksToBounds = YES;
+
+        label.translatesAutoresizingMaskIntoConstraints = NO;
+
+        label.tag = 7654321;
+
+        UIView *oldLabel = [window viewWithTag:7654321];
+
+        if (oldLabel)
+        {
+            [oldLabel removeFromSuperview];
+        }
+
+        [window addSubview:label];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [label.centerXAnchor constraintEqualToAnchor:window.centerXAnchor],
+            [label.topAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.topAnchor
+                                            constant:10.0],
+            [label.widthAnchor constraintLessThanOrEqualToAnchor:window.widthAnchor
+                                                        multiplier:0.9],
+            [label.heightAnchor constraintGreaterThanOrEqualToConstant:40.0]
+        ]];
+    });
+}
+
+static NSUInteger BHFThreadCount(void)
+{
+    task_basic_info_data_t taskInfo;
+    mach_msg_type_number_t taskInfoCount =
+        TASK_BASIC_INFO_COUNT;
+
+    kern_return_t result =
+        task_info(
+            mach_task_self(),
+            TASK_BASIC_INFO,
+            (task_info_t)&taskInfo,
+            &taskInfoCount
+        );
+
+    if (result != KERN_SUCCESS)
+    {
         return 0;
     }
 
-    return (NSUInteger)(
-        info.phys_footprint /
-        (1024ULL * 1024ULL)
+    thread_act_array_t threads;
+    mach_msg_type_number_t threadCount = 0;
+
+    result =
+        task_threads(
+            mach_task_self(),
+            &threads,
+            &threadCount
+        );
+
+    if (result != KERN_SUCCESS)
+    {
+        return 0;
+    }
+
+    for (mach_msg_type_number_t i = 0; i < threadCount; i++)
+    {
+        mach_port_deallocate(
+            mach_task_self(),
+            threads[i]
+        );
+    }
+
+    vm_deallocate(
+        mach_task_self(),
+        (vm_address_t)threads,
+        threadCount * sizeof(thread_act_t)
     );
+
+    return threadCount;
 }
 
-static NSString *BHFThreadName(thread_t thread)
+static double BHFMemoryMB(void)
 {
-    char name[256];
-    memset(name, 0, sizeof(name));
-
-    thread_identifier_info_data_t identifier;
+    task_basic_info_data_t taskInfo;
     mach_msg_type_number_t count =
-        THREAD_IDENTIFIER_INFO_COUNT;
+        TASK_BASIC_INFO_COUNT;
 
-    kern_return_t kr = thread_info(
-        thread,
-        THREAD_IDENTIFIER_INFO,
-        (thread_info_t)&identifier,
-        &count
-    );
+    kern_return_t result =
+        task_info(
+            mach_task_self(),
+            TASK_BASIC_INFO,
+            (task_info_t)&taskInfo,
+            &count
+        );
 
-    if (kr != KERN_SUCCESS) {
-        return @"unknown";
+    if (result != KERN_SUCCESS)
+    {
+        return 0.0;
     }
 
-    thread_basic_info_data_t basic;
-    count = THREAD_BASIC_INFO_COUNT;
+    return (double)taskInfo.resident_size / 1024.0 / 1024.0;
+}
 
-    kr = thread_info(
-        thread,
-        THREAD_BASIC_INFO,
-        (thread_info_t)&basic,
-        &count
-    );
+static double BHFCPUTimeSeconds(void)
+{
+    task_thread_times_info_data_t info;
+    mach_msg_type_number_t count =
+        TASK_THREAD_TIMES_INFO_COUNT;
 
-    if (kr != KERN_SUCCESS) {
-        return @"unknown";
+    kern_return_t result =
+        task_info(
+            mach_task_self(),
+            TASK_THREAD_TIMES_INFO,
+            (task_info_t)&info,
+            &count
+        );
+
+    if (result != KERN_SUCCESS)
+    {
+        return 0.0;
     }
 
-    if (basic.flags & TH_FLAGS_IDLE) {
-        return @"idle";
-    }
+    double user =
+        (double)info.user_time.seconds +
+        ((double)info.user_time.microseconds / 1000000.0);
 
-    return @"unnamed";
+    double system =
+        (double)info.system_time.seconds +
+        ((double)info.system_time.microseconds / 1000000.0);
+
+    return user + system;
 }
 
 static void BHFUpdateOverlay(void)
 {
-    task_t task = mach_task_self();
-
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t threadCount = 0;
-
-    kern_return_t kr = task_threads(
-        task,
-        &threads,
-        &threadCount
-    );
-
-    if (kr != KERN_SUCCESS || threads == NULL) {
-        return;
-    }
-
-    static uint64_t previousTime = 0;
-    static uint64_t previousCPU[BHF_MAX_THREADS];
-    static uint32_t previousTID[BHF_MAX_THREADS];
-
-    uint64_t currentTime = BHFNow();
-
-    BHFThreadUsage usage[BHF_MAX_THREADS];
-    NSUInteger usageCount = 0;
-
-    for (mach_msg_type_number_t i = 0;
-         i < threadCount && i < BHF_MAX_THREADS;
-         i++) {
-
-        thread_t thread = threads[i];
-
-        thread_identifier_info_data_t identifier;
-        mach_msg_type_number_t identifierCount =
-            THREAD_IDENTIFIER_INFO_COUNT;
-
-        kern_return_t identifierResult =
-            thread_info(
-                thread,
-                THREAD_IDENTIFIER_INFO,
-                (thread_info_t)&identifier,
-                &identifierCount
-            );
-
-        if (identifierResult != KERN_SUCCESS) {
-            continue;
-        }
-
-        uint32_t tid =
-            (uint32_t)identifier.thread_id;
-
-        thread_basic_info_data_t basic;
-        mach_msg_type_number_t basicCount =
-            THREAD_BASIC_INFO_COUNT;
-
-        kern_return_t basicResult =
-            thread_info(
-                thread,
-                THREAD_BASIC_INFO,
-                (thread_info_t)&basic,
-                &basicCount
-            );
-
-        if (basicResult != KERN_SUCCESS) {
-            continue;
-        }
-
-        uint64_t currentCPU =
-            ((uint64_t)basic.user_time.seconds *
-             1000000000ULL) +
-            ((uint64_t)basic.user_time.microseconds *
-             1000ULL) +
-            ((uint64_t)basic.system_time.seconds *
-             1000000000ULL) +
-            ((uint64_t)basic.system_time.microseconds *
-             1000ULL);
-
-        double percent = 0.0;
-
-        for (NSUInteger j = 0;
-             j < BHF_MAX_THREADS;
-             j++) {
-
-            if (previousTID[j] == tid) {
-
-                percent =
-                    BHFThreadCPUPercent(
-                        thread,
-                        previousTime,
-                        currentTime,
-                        previousCPU[j],
-                        currentCPU
-                    );
-
-                break;
-            }
-        }
-
-        if (usageCount < BHF_MAX_THREADS) {
-            usage[usageCount].tid = tid;
-            usage[usageCount].cpu = percent;
-            usageCount++;
-        }
-    }
-
-    previousTime = currentTime;
-
-    for (mach_msg_type_number_t i = 0;
-         i < threadCount && i < BHF_MAX_THREADS;
-         i++) {
-
-        thread_t thread = threads[i];
-
-        thread_identifier_info_data_t identifier;
-        mach_msg_type_number_t count =
-            THREAD_IDENTIFIER_INFO_COUNT;
-
-        if (thread_info(
-                thread,
-                THREAD_IDENTIFIER_INFO,
-                (thread_info_t)&identifier,
-                &count) != KERN_SUCCESS) {
-            continue;
-        }
-
-        thread_basic_info_data_t basic;
-        count = THREAD_BASIC_INFO_COUNT;
-
-        if (thread_info(
-                thread,
-                THREAD_BASIC_INFO,
-                (thread_info_t)&basic,
-                &count) != KERN_SUCCESS) {
-            continue;
-        }
-
-        uint64_t currentCPU =
-            ((uint64_t)basic.user_time.seconds *
-             1000000000ULL) +
-            ((uint64_t)basic.user_time.microseconds *
-             1000ULL) +
-            ((uint64_t)basic.system_time.seconds *
-             1000000000ULL) +
-            ((uint64_t)basic.system_time.microseconds *
-             1000ULL);
-
-        uint32_t tid =
-            (uint32_t)identifier.thread_id;
-
-        previousTID[i] = tid;
-        previousCPU[i] = currentCPU;
-    }
-
-    if (threads != NULL) {
-        vm_deallocate(
-            task,
-            (vm_address_t)threads,
-            threadCount * sizeof(thread_t)
-        );
-    }
-
-    for (NSUInteger i = 0; i < usageCount; i++) {
-
-        for (NSUInteger j = i + 1;
-             j < usageCount;
-             j++) {
-
-            if (usage[j].cpu > usage[i].cpu) {
-
-                BHFThreadUsage temp =
-                    usage[i];
-
-                usage[i] =
-                    usage[j];
-
-                usage[j] =
-                    temp;
-            }
-        }
-    }
-
-    double totalCPU = 0.0;
-
-    for (NSUInteger i = 0;
-         i < usageCount;
-         i++) {
-        totalCPU += usage[i].cpu;
-    }
-
-    NSMutableString *text =
-        [NSMutableString string];
-
-    [text appendString:
-        @"BumbleHeatFix\n"
-         "THREAD MONITOR\n"
-         "──────────────\n"];
-
-    [text appendFormat:
-        @"Process CPU: %.1f%%\n",
-        totalCPU];
-
-    [text appendFormat:
-        @"Threads: %u\n",
-        threadCount];
-
-    [text appendFormat:
-        @"Memory: %lu MB\n\n",
-        (unsigned long)BHFMemoryMB()];
-
-    [text appendString:
-        @"TOP THREADS\n"];
-
-    NSUInteger topCount =
-        MIN((NSUInteger)3, usageCount);
-
-    for (NSUInteger i = 0;
-         i < topCount;
-         i++) {
-
-        [text appendFormat:
-            @"%lu. TID %u  %.1f%%\n",
-            (unsigned long)(i + 1),
-            usage[i].tid,
-            usage[i].cpu];
-    }
-
-    dispatch_async(
-        dispatch_get_main_queue(),
-        ^{
-            if (BHFLabel != nil) {
-                BHFLabel.text = text;
-            }
-        }
-    );
-}
-
-static UIWindow *BHFFindWindow(void)
-{
-    if (@available(iOS 13.0, *)) {
-
-        for (UIScene *scene
-             in [UIApplication sharedApplication].connectedScenes) {
-
-            if (![scene isKindOfClass:
-                    [UIWindowScene class]]) {
-                continue;
-            }
-
-            UIWindowScene *windowScene =
-                (UIWindowScene *)scene;
-
-            if (windowScene.activationState !=
-                    UISceneActivationStateForegroundActive &&
-                windowScene.activationState !=
-                    UISceneActivationStateForegroundInactive) {
-                continue;
-            }
-
-            for (UIWindow *window
-                 in windowScene.windows) {
-
-                if (window.hidden) {
-                    continue;
-                }
-
-                if (window.rootViewController == nil) {
-                    continue;
-                }
-
-                if (window.windowLevel !=
-                    UIWindowLevelNormal) {
-                    continue;
-                }
-
-                return window;
-            }
-        }
-    }
-
-    return nil;
-}
-
-static void BHFCreateOverlay(void)
-{
-    dispatch_async(
-        dispatch_get_main_queue(),
-        ^{
-
-        if (BHFOverlayWindow != nil) {
-            return;
-        }
-
-        UIWindow *hostWindow =
-            BHFFindWindow();
-
-        if (hostWindow == nil) {
-            NSLog(
-                @"[BumbleHeatFix] "
-                @"Could not find Bumble window"
-            );
-            return;
-        }
-
-        CGRect bounds =
-            hostWindow.bounds;
-
-        CGFloat width =
-            MIN(270.0,
-                bounds.size.width - 20.0);
-
-        BHFOverlayWindow =
-            [[UIWindow alloc]
-                initWithFrame:
-                    CGRectMake(
-                        10.0,
-                        55.0,
-                        width,
-                        170.0
-                    )];
-
-        BHFOverlayWindow.windowLevel =
-            UIWindowLevelAlert + 100.0;
-
-        BHFOverlayWindow.backgroundColor =
-            [UIColor colorWithWhite:0.0
-                              alpha:0.85];
-
-        BHFOverlayWindow.layer.cornerRadius =
-            12.0;
-
-        BHFOverlayWindow.clipsToBounds =
-            YES;
-
-        UIViewController *controller =
-            [[UIViewController alloc] init];
-
-        BHFOverlayWindow.rootViewController =
-            controller;
-
-        BHFLabel =
-            [[UILabel alloc]
-                initWithFrame:
-                    controller.view.bounds];
-
-        BHFLabel.autoresizingMask =
-            UIViewAutoresizingFlexibleWidth |
-            UIViewAutoresizingFlexibleHeight;
-
-        BHFLabel.textColor =
-            [UIColor whiteColor];
-
-        BHFLabel.backgroundColor =
-            [UIColor clearColor];
-
-        BHFLabel.font =
-            [UIFont monospacedSystemFontOfSize:
-                12.0
-                weight:UIFontWeightMedium];
-
-        BHFLabel.numberOfLines = 0;
-
-        BHFLabel.textAlignment =
-            NSTextAlignmentLeft;
-
-        BHFLabel.text =
+    double cpuTime = BHFCPUTimeSeconds();
+    NSUInteger threads = BHFThreadCount();
+    double memory = BHFMemoryMB();
+
+    NSString *text =
+        [NSString stringWithFormat:
             @"BumbleHeatFix\n"
-             "THREAD MONITOR\n"
-             "Starting...";
+             "CPU time: %.1fs\n"
+             "Threads: %lu\n"
+             "Memory: %.0f MB",
+             cpuTime,
+             (unsigned long)threads,
+             memory];
 
-        [controller.view addSubview:BHFLabel];
-
-        BHFOverlayWindow.hidden = NO;
-
-        NSLog(
-            @"[BumbleHeatFix] "
-            @"Thread monitor started"
-        );
-
-        [NSTimer scheduledTimerWithTimeInterval:
-            1.0
-            repeats:YES
-            block:^(NSTimer *timer) {
-                BHFUpdateOverlay();
-            }];
-    });
+    BHFShowMessage(text);
 }
 
 %ctor
 {
-    @autoreleasepool {
+    @autoreleasepool
+    {
+        BHFLog(@"================================");
+        BHFLog(@"BumbleHeatFix diagnostic loaded");
+        BHFLog(@"Process: %@",
+                [[NSProcessInfo processInfo] processName]);
+        BHFLog(@"iOS: %@",
+                [[UIDevice currentDevice] systemVersion]);
+        BHFLog(@"================================");
 
-        NSString *processName =
-            [[NSProcessInfo processInfo]
-                processName];
-
-        NSLog(
-            @"[BumbleHeatFix] "
-            @"DYLIB LOADED: %@",
-            processName
-        );
-
-        if (![processName.lowercaseString
-                containsString:@"bumble"]) {
-            return;
-        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BHFShowMessage(
+                @"BumbleHeatFix\n"
+                 "DIAGNOSTIC MODE\n"
+                 "Dylib: LOADED"
+            );
+        });
 
         dispatch_after(
             dispatch_time(
                 DISPATCH_TIME_NOW,
-                (int64_t)(2 * NSEC_PER_SEC)
+                3 * NSEC_PER_SEC
             ),
             dispatch_get_main_queue(),
             ^{
-                BHFCreateOverlay();
+                BHFLog(
+                    @"Initial CPU: %.2fs | Threads: %lu | Memory: %.0f MB",
+                    BHFCPUTimeSeconds(),
+                    (unsigned long)BHFThreadCount(),
+                    BHFMemoryMB()
+                );
+
+                BHFUpdateOverlay();
+            }
+        );
+
+        dispatch_after(
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                10 * NSEC_PER_SEC
+            ),
+            dispatch_get_main_queue(),
+            ^{
+                BHFLog(
+                    @"10-second CPU: %.2fs | Threads: %lu | Memory: %.0f MB",
+                    BHFCPUTimeSeconds(),
+                    (unsigned long)BHFThreadCount(),
+                    BHFMemoryMB()
+                );
+
+                BHFUpdateOverlay();
+            }
+        );
+
+        dispatch_after(
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                30 * NSEC_PER_SEC
+            ),
+            dispatch_get_main_queue(),
+            ^{
+                BHFLog(
+                    @"30-second CPU: %.2fs | Threads: %lu | Memory: %.0f MB",
+                    BHFCPUTimeSeconds(),
+                    (unsigned long)BHFThreadCount(),
+                    BHFMemoryMB()
+                );
+
+                BHFUpdateOverlay();
             }
         );
     }
