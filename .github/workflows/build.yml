@@ -1,59 +1,49 @@
-name: Build BumbleHeatFix
+name: Build BumbleHeatFix dylib
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
+push:
+branches:
+- main
+workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: macos-14
+build:
+runs-on: macos-14
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-      - name: Install Theos
-        run: |
-          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+  - name: Install Theos
+    run: |
+      git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
 
-      - name: Install ldid
-        run: |
-          brew install ldid-procursus
+  - name: Install ldid
+    run: |
+      brew install ldid-procursus
 
-      - name: Build dylib
-        run: |
-          export THEOS="$HOME/theos"
-          make clean
-          make package FINALPACKAGE=1
+  - name: Build dylib
+    run: |
+      export THEOS="$HOME/theos"
+      make clean
+      make package FINALPACKAGE=1
 
-      - name: Show build output
-        run: |
-          echo "=== DEB ==="
-          find packages -type f -name "*.deb" -print || true
+  - name: Verify dylib
+    run: |
+      echo "=== DYLIB ==="
+      find .theos -type f -name "BumbleHeatFix.dylib" -print
 
-          echo "=== DYLIB ==="
-          find .theos -type f -name "BumbleHeatFix.dylib" -print || true
+      echo "=== PLIST ==="
+      find .theos -type f -name "BumbleHeatFix.plist" -print
 
-          echo "=== PLIST ==="
-          find .theos -type f -name "BumbleHeatFix.plist" -print || true
+      echo "=== PACKAGE ==="
+      find packages -type f -name "*.deb" -print 2>/dev/null || true
 
-      - name: Prepare dylib artifact
-        run: |
-          mkdir -p artifact
-
-          cp \
-            .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib \
-            artifact/BumbleHeatFix.dylib
-
-          cp \
-            .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist \
-            artifact/BumbleHeatFix.plist
-
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: BumbleHeatFix-dylib
-          path: artifact/*
-          if-no-files-found: error
+  - name: Upload dylib and plist
+    uses: actions/upload-artifact@v4
+    with:
+      name: BumbleHeatFix-dylib
+      path: |
+        .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.dylib
+        .theos/_/Library/MobileSubstrate/DynamicLibraries/BumbleHeatFix.plist
+      if-no-files-found: error
