@@ -1,12 +1,11 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
 
 #import <dlfcn.h>
-#import <mach/mach.h>
-#import <mach/task_info.h>
+#import <mach-o/dyld.h>
 
-#pragma mark - BumbleHeatFix v3.3
+
+#pragma mark - BumbleHeatFix v3.3.1
 #pragma mark - YapDatabase Symbol Resolver
 #pragma mark - RESOLUTION ONLY
 #pragma mark - No hooks
@@ -19,10 +18,10 @@ static UILabel *BHFLabel = nil;
 static NSTimer *BHFResolveTimer = nil;
 
 static BOOL BHFResolved = NO;
+
 static uintptr_t BHFResolvedAddress = 0;
 static uintptr_t BHFImageBase = 0;
 
-static NSString *BHFResolvedImage = nil;
 static NSString *BHFResolvedPath = nil;
 static NSString *BHFResolvedSymbol = nil;
 
@@ -40,13 +39,11 @@ static UIWindow *BHFGetWindow(void)
 
             if (scene.activationState !=
                 UISceneActivationStateForegroundActive) {
-
                 continue;
             }
 
             if (![scene isKindOfClass:
                     [UIWindowScene class]]) {
-
                 continue;
             }
 
@@ -96,8 +93,7 @@ static void BHFCreateOverlay(void)
                             680
                         )];
 
-            BHFLabel.numberOfLines =
-                0;
+            BHFLabel.numberOfLines = 0;
 
             BHFLabel.textAlignment =
                 NSTextAlignmentLeft;
@@ -117,16 +113,14 @@ static void BHFCreateOverlay(void)
                     colorWithAlphaComponent:
                         0.94];
 
-            BHFLabel.layer.cornerRadius =
-                8.0;
-
-            BHFLabel.layer.masksToBounds =
-                YES;
+            BHFLabel.layer.cornerRadius = 8.0;
+            BHFLabel.layer.masksToBounds = YES;
 
             BHFLabel.text =
                 @"BumbleHeatFix\n"
-                 "SYMBOL RESOLVER v3.3\n\n"
-                 "Searching for YapRowidSetEnumerate...";
+                 "SYMBOL RESOLVER v3.3.1\n\n"
+                 "Searching for\n"
+                 "YapRowidSetEnumerate...";
 
             [window addSubview:BHFLabel];
         }
@@ -154,15 +148,12 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Address Information
+#pragma mark - Address Resolver
 
 static void BHFResolveAddress(
     uintptr_t address
 )
 {
-    BHFResolvedAddress =
-        address;
-
     Dl_info info;
 
     memset(
@@ -171,75 +162,85 @@ static void BHFResolveAddress(
         sizeof(info)
     );
 
-    if (dladdr(
+    if (!dladdr(
             (const void *)address,
             &info)) {
 
-        BHFResolved = YES;
-
-        if (info.dli_fname != NULL) {
-
-            BHFResolvedPath =
-                [NSString
-                    stringWithUTF8String:
-                        info.dli_fname];
-        }
-
-        if (info.dli_sname != NULL) {
-
-            BHFResolvedSymbol =
-                [NSString
-                    stringWithUTF8String:
-                        info.dli_sname];
-        }
-
-        if (info.dli_fbase != NULL) {
-
-            BHFImageBase =
-                (uintptr_t)
-                    info.dli_fbase;
-        }
-
-        if (BHFResolvedPath == nil) {
-            BHFResolvedPath =
-                @"unknown";
-        }
-
-        if (BHFResolvedSymbol == nil) {
-            BHFResolvedSymbol =
-                @"<redacted/unknown>";
-        }
-
-        if (BHFImageBase != 0 &&
-            BHFResolvedAddress >=
-                BHFImageBase) {
-
-            BHFResolvedImage =
-                [NSString
-                    stringWithFormat:
-                        @"%@",
-                        BHFResolvedPath];
-        }
-
+        BHFResolved = NO;
         return;
     }
 
-    BHFResolved = NO;
+
+    BHFResolvedAddress =
+        address;
+
+
+    if (info.dli_fbase != NULL) {
+
+        BHFImageBase =
+            (uintptr_t)
+                info.dli_fbase;
+    }
+    else {
+
+        BHFImageBase = 0;
+    }
+
+
+    if (info.dli_fname != NULL) {
+
+        BHFResolvedPath =
+            [NSString
+                stringWithUTF8String:
+                    info.dli_fname];
+    }
+    else {
+
+        BHFResolvedPath =
+            @"unknown";
+    }
+
+
+    if (info.dli_sname != NULL) {
+
+        BHFResolvedSymbol =
+            [NSString
+                stringWithUTF8String:
+                    info.dli_sname];
+    }
+    else {
+
+        BHFResolvedSymbol =
+            @"<unknown>";
+    }
+
+
+    BHFResolved = YES;
 }
 
 
-#pragma mark - Symbol Resolver
+#pragma mark - Exact Symbol Resolution
 
 static void BHFResolveYapDatabase(void)
 {
+    BHFResolved = NO;
+
+    BHFResolvedAddress = 0;
+    BHFImageBase = 0;
+
+    BHFResolvedPath = nil;
+    BHFResolvedSymbol = nil;
+
+
     /*
-     * First try the exact symbol name.
+     * Try the exact exported symbol first.
      */
     void *symbol =
         dlsym(
             RTLD_DEFAULT,
             "YapRowidSetEnumerate"
         );
+
 
     if (symbol != NULL) {
 
@@ -252,10 +253,9 @@ static void BHFResolveYapDatabase(void)
 
 
     /*
-     * Some Mach-O images expose symbols only
-     * through their specific handle.
+     * Search loaded Mach-O images.
      *
-     * Search loaded images for YapDatabase.
+     * This does NOT modify anything.
      */
     uint32_t imageCount =
         _dyld_image_count();
@@ -268,26 +268,32 @@ static void BHFResolveYapDatabase(void)
         const char *imageName =
             _dyld_get_image_name(i);
 
+
         if (imageName == NULL) {
             continue;
         }
 
-        NSString *name =
+
+        NSString *image =
             [NSString
                 stringWithUTF8String:
                     imageName];
 
-        if (name == nil) {
+
+        if (image == nil) {
             continue;
         }
 
 
-        if ([name
+        NSRange range =
+            [image
                 rangeOfString:
                     @"YapDatabase"
                 options:
-                    NSCaseInsensitiveSearch]
-                .location ==
+                    NSCaseInsensitiveSearch];
+
+
+        if (range.location ==
             NSNotFound) {
 
             continue;
@@ -299,6 +305,7 @@ static void BHFResolveYapDatabase(void)
                 imageName,
                 RTLD_NOW
             );
+
 
         if (handle == NULL) {
             continue;
@@ -318,6 +325,7 @@ static void BHFResolveYapDatabase(void)
                 (uintptr_t)symbol
             );
 
+
             dlclose(handle);
 
             return;
@@ -326,13 +334,10 @@ static void BHFResolveYapDatabase(void)
 
         dlclose(handle);
     }
-
-
-    BHFResolved = NO;
 }
 
 
-#pragma mark - Resolver Output
+#pragma mark - Output
 
 static NSString *BHFResolverText(void)
 {
@@ -340,18 +345,18 @@ static NSString *BHFResolverText(void)
 
         return
             @"BumbleHeatFix\n"
-             "SYMBOL RESOLVER v3.3\n\n"
+             "SYMBOL RESOLVER v3.3.1\n\n"
              "TARGET:\n"
              "YapRowidSetEnumerate\n\n"
              "STATUS:\n"
              "NOT RESOLVED\n\n"
-             "The symbol was not exposed by "
-             "the loaded image.\n\n"
+             "No exported address found.\n\n"
              "No modification performed.";
     }
 
 
     uintptr_t offset = 0;
+
 
     if (BHFImageBase != 0 &&
         BHFResolvedAddress >=
@@ -367,7 +372,7 @@ static NSString *BHFResolverText(void)
         [NSString
             stringWithFormat:
                 @"BumbleHeatFix\n"
-                 "SYMBOL RESOLVER v3.3\n\n"
+                 "SYMBOL RESOLVER v3.3.1\n\n"
                  "TARGET:\n"
                  "YapRowidSetEnumerate\n\n"
                  "STATUS:\n"
@@ -405,12 +410,12 @@ static NSString *BHFResolverText(void)
 
                 BHFResolvedSymbol != nil
                     ? BHFResolvedSymbol
-                    : @"<redacted/unknown>"
+                    : @"<unknown>"
         ];
 }
 
 
-#pragma mark - Periodic Resolution
+#pragma mark - Resolution
 
 static void BHFPerformResolution(void)
 {
@@ -430,7 +435,7 @@ static void BHFPerformResolution(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "SYMBOL RESOLVER v3.3 loaded"
+             "SYMBOL RESOLVER v3.3.1 loaded"
         );
 
 
@@ -446,17 +451,12 @@ static void BHFPerformResolution(void)
 
                 BHFCreateOverlay();
 
-
-                /*
-                 * Resolve once immediately.
-                 */
                 BHFPerformResolution();
 
 
                 /*
-                 * Retry a few times because the
-                 * framework may finish loading
-                 * shortly after Bumble launches.
+                 * Retry because YapDatabase may
+                 * not yet be completely loaded.
                  */
                 __block NSUInteger attempts = 0;
 
@@ -475,10 +475,6 @@ static void BHFPerformResolution(void)
                             BHFPerformResolution();
 
 
-                            /*
-                             * Once resolved, we don't
-                             * need to keep searching.
-                             */
                             if (BHFResolved ||
                                 attempts >= 10) {
 
