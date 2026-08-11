@@ -1,3 +1,4 @@
+```objc
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -10,7 +11,6 @@
 #import <dlfcn.h>
 
 #include <stdint.h>
-#include <string.h>
 
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFMonitorTimer = nil;
@@ -32,8 +32,10 @@ static UIWindow *BHFGetWindow(void)
 
     if (@available(iOS 13.0, *)) {
 
-        for (UIScene *scene in
-             [UIApplication sharedApplication].connectedScenes) {
+        NSSet<UIScene *> *scenes =
+            [UIApplication sharedApplication].connectedScenes;
+
+        for (UIScene *scene in scenes) {
 
             if (scene.activationState !=
                 UISceneActivationStateForegroundActive) {
@@ -65,7 +67,7 @@ static UIWindow *BHFGetWindow(void)
 }
 
 
-#pragma mark - Run State
+#pragma mark - Thread State
 
 static NSString *BHFRunStateName(integer_t state)
 {
@@ -113,20 +115,20 @@ static double BHFProcessCPUTime(void)
         return 0.0;
     }
 
-    uint64_t user =
+    uint64_t userTime =
         ((uint64_t)info.user_time.seconds *
          1000000000ULL) +
         ((uint64_t)info.user_time.microseconds *
          1000ULL);
 
-    uint64_t system =
+    uint64_t systemTime =
         ((uint64_t)info.system_time.seconds *
          1000000000ULL) +
         ((uint64_t)info.system_time.microseconds *
          1000ULL);
 
     return
-        (double)(user + system) /
+        (double)(userTime + systemTime) /
         1000000000.0;
 }
 
@@ -163,19 +165,14 @@ static NSUInteger BHFMemoryMB(void)
 #pragma mark - Thread Sample
 
 typedef struct {
-
     thread_t thread;
-
     double cpu;
-
     integer_t runState;
-
     uint64_t pc;
-
 } BHFThreadSample;
 
 
-#pragma mark - Thread PC
+#pragma mark - Get Thread PC
 
 static BOOL BHFGetThreadPC(
     thread_t thread,
@@ -212,7 +209,7 @@ static BOOL BHFGetThreadPC(
 }
 
 
-#pragma mark - Thread Collection
+#pragma mark - Collect Threads
 
 static NSUInteger BHFCollectThreads(
     BHFThreadSample *samples,
@@ -220,7 +217,6 @@ static NSUInteger BHFCollectThreads(
 )
 {
     thread_act_array_t threadList = NULL;
-
     mach_msg_type_number_t threadCount = 0;
 
     kern_return_t kr =
@@ -232,14 +228,12 @@ static NSUInteger BHFCollectThreads(
 
     if (kr != KERN_SUCCESS ||
         threadList == NULL) {
-
         return 0;
     }
 
     BHFThreadSample temp[64];
 
     NSUInteger tempCount = 0;
-
 
     for (NSUInteger i = 0;
          i < threadCount &&
@@ -263,45 +257,28 @@ static NSUInteger BHFCollectThreads(
             continue;
         }
 
-
         double cpu =
             ((double)info.cpu_usage /
              (double)TH_USAGE_SCALE) *
             100.0;
 
-
         if (cpu < 0.1) {
             continue;
         }
 
-
-        BHFThreadSample sample;
-
-        memset(
-            &sample,
-            0,
-            sizeof(sample)
-        );
-
-
-        sample.thread =
-            threadList[i];
-
-        sample.cpu =
-            cpu;
-
-        sample.runState =
-            info.run_state;
-
+        BHFThreadSample sample = {
+            threadList[i],
+            cpu,
+            info.run_state,
+            0
+        };
 
         BHFGetThreadPC(
             threadList[i],
             &sample.pc
         );
 
-
-        temp[tempCount++] =
-            sample;
+        temp[tempCount++] = sample;
     }
 
 
@@ -334,10 +311,7 @@ static NSUInteger BHFCollectThreads(
 
 
     NSUInteger resultCount =
-        MIN(
-            tempCount,
-            maximum
-        );
+        MIN(tempCount, maximum);
 
 
     for (NSUInteger i = 0;
@@ -352,63 +326,54 @@ static NSUInteger BHFCollectThreads(
     vm_deallocate(
         mach_task_self(),
         (vm_address_t)threadList,
-        threadCount *
-        sizeof(thread_t)
+        threadCount * sizeof(thread_t)
     );
-
 
     return resultCount;
 }
 
 
-#pragma mark - dladdr Resolver
+#pragma mark - Address Resolver
 
 typedef struct {
-
     BOOL found;
 
     NSString *imageName;
-
     NSString *imagePath;
-
     NSString *symbolName;
 
     uint64_t imageBase;
-
     uint64_t symbolAddress;
 
     uint64_t imageOffset;
-
     uint64_t symbolOffset;
-
 } BHFResolvedAddress;
 
 
 static BHFResolvedAddress
 BHFResolveAddress(uint64_t address)
 {
-    BHFResolvedAddress result;
+    /*
+     * Do NOT use memset() here because this
+     * structure contains Objective-C objects.
+     */
 
-    memset(
-        &result,
+    BHFResolvedAddress result = {
+        NO,
+        nil,
+        nil,
+        nil,
         0,
-        sizeof(result)
-    );
-
+        0,
+        0,
+        0
+    };
 
     if (address == 0) {
         return result;
     }
 
-
-    Dl_info info;
-
-    memset(
-        &info,
-        0,
-        sizeof(info)
-    );
-
+    Dl_info info = {0};
 
     int success =
         dladdr(
@@ -416,64 +381,78 @@ BHFResolveAddress(uint64_t address)
             &info
         );
 
-
     if (!success) {
         return result;
     }
 
-
     result.found = YES;
 
+
+    /*
+     * Image path/name
+     */
 
     if (info.dli_fname != NULL) {
 
         result.imagePath =
-            [NSString
-                stringWithUTF8String:
-                    info.dli_fname];
+            [NSString stringWithUTF8String:
+                info.dli_fname];
 
-        result.imageName =
-            [result.imagePath
-                lastPathComponent];
-    }
-    else {
+        if (result.imagePath != nil) {
 
-        result.imageName =
-            @"unknown";
+            result.imageName =
+                [result.imagePath lastPathComponent];
+        }
     }
 
+    if (result.imageName == nil) {
+        result.imageName = @"unknown";
+    }
+
+
+    /*
+     * Image base
+     */
 
     if (info.dli_fbase != NULL) {
 
         result.imageBase =
-            (uint64_t)
-                (uintptr_t)
-                    info.dli_fbase;
+            (uint64_t)(uintptr_t)
+                info.dli_fbase;
     }
 
+
+    /*
+     * Symbol
+     */
 
     if (info.dli_sname != NULL) {
 
         result.symbolName =
-            [NSString
-                stringWithUTF8String:
-                    info.dli_sname];
-    }
-    else {
-
-        result.symbolName =
-            @"<no symbol>";
+            [NSString stringWithUTF8String:
+                info.dli_sname];
     }
 
+    if (result.symbolName == nil) {
+        result.symbolName = @"<no symbol>";
+    }
+
+
+    /*
+     * Symbol address
+     */
 
     if (info.dli_saddr != NULL) {
 
         result.symbolAddress =
-            (uint64_t)
-                (uintptr_t)
-                    info.dli_saddr;
+            (uint64_t)(uintptr_t)
+                info.dli_saddr;
     }
 
+
+    /*
+     * Address relative to image
+     */
 
     if (result.imageBase != 0 &&
         address >= result.imageBase) {
@@ -484,6 +463,10 @@ BHFResolveAddress(uint64_t address)
     }
 
 
+    /*
+     * Address relative to symbol
+     */
+
     if (result.symbolAddress != 0 &&
         address >= result.symbolAddress) {
 
@@ -491,7 +474,6 @@ BHFResolveAddress(uint64_t address)
             address -
             result.symbolAddress;
     }
-
 
     return result;
 }
@@ -509,15 +491,12 @@ static void BHFCreateOverlay(void)
             return;
         }
 
-
         UIWindow *window =
             BHFGetWindow();
-
 
         if (window == nil) {
             return;
         }
-
 
         BHFLabel =
             [[UILabel alloc]
@@ -529,37 +508,25 @@ static void BHFCreateOverlay(void)
                         700
                     )];
 
-
-        BHFLabel.numberOfLines =
-            0;
-
+        BHFLabel.numberOfLines = 0;
 
         BHFLabel.textAlignment =
             NSTextAlignmentLeft;
-
 
         BHFLabel.font =
             [UIFont
                 monospacedSystemFontOfSize:9.0
                 weight:UIFontWeightMedium];
 
-
         BHFLabel.textColor =
             [UIColor whiteColor];
-
 
         BHFLabel.backgroundColor =
             [[UIColor blackColor]
                 colorWithAlphaComponent:0.90];
 
-
-        BHFLabel.layer.cornerRadius =
-            8.0;
-
-
-        BHFLabel.layer.masksToBounds =
-            YES;
-
+        BHFLabel.layer.cornerRadius = 8.0;
+        BHFLabel.layer.masksToBounds = YES;
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
@@ -567,7 +534,6 @@ static void BHFCreateOverlay(void)
              "CPU: measuring...\n"
              "Peak: measuring...\n"
              "Resolving hottest thread...";
-
 
         [window addSubview:BHFLabel];
     });
@@ -586,41 +552,35 @@ static void BHFUpdateOverlay(
             BHFCreateOverlay();
         }
 
-
         if (BHFLabel != nil) {
-            BHFLabel.text =
-                text;
+            BHFLabel.text = text;
         }
     });
 }
 
 
-#pragma mark - Monitor
+#pragma mark - Statistics
 
 static void BHFCollectStats(void)
 {
-    CFTimeInterval now =
+    CFTimeInterval currentTime =
         CACurrentMediaTime();
 
-
-    double currentCPU =
+    double currentCPUTime =
         BHFProcessCPUTime();
 
 
     if (BHFPreviousTime > 0.0 &&
-        now > BHFPreviousTime &&
-        currentCPU >=
-            BHFPreviousCPUTime) {
+        currentTime > BHFPreviousTime &&
+        currentCPUTime >= BHFPreviousCPUTime) {
 
         double elapsed =
-            now -
+            currentTime -
             BHFPreviousTime;
 
-
         double delta =
-            currentCPU -
+            currentCPUTime -
             BHFPreviousCPUTime;
-
 
         if (elapsed > 0.0) {
 
@@ -632,11 +592,10 @@ static void BHFCollectStats(void)
 
 
     BHFPreviousTime =
-        now;
-
+        currentTime;
 
     BHFPreviousCPUTime =
-        currentCPU;
+        currentCPUTime;
 
 
     if (BHFCPUPercent >
@@ -650,13 +609,11 @@ static void BHFCollectStats(void)
     BHFThreadSample samples[
         BHF_MAX_THREADS];
 
-
     NSUInteger count =
         BHFCollectThreads(
             samples,
             BHF_MAX_THREADS
         );
-
 
     NSUInteger memory =
         BHFMemoryMB();
@@ -674,9 +631,7 @@ static void BHFCollectStats(void)
          "Memory: %lu MB\n\n",
 
         BHFCPUPercent,
-
         BHFPeakCPU,
-
         (unsigned long)memory
     ];
 
@@ -686,18 +641,18 @@ static void BHFCollectStats(void)
         [output appendString:
             @"No active CPU threads.\n"];
 
-
-        BHFUpdateOverlay(
-            output
-        );
+        BHFUpdateOverlay(output);
 
         return;
     }
 
 
+    /*
+     * Hottest thread
+     */
+
     BHFThreadSample hot =
         samples[0];
-
 
     BHFResolvedAddress resolved =
         BHFResolveAddress(
@@ -710,10 +665,9 @@ static void BHFCollectStats(void)
 
 
     [output appendFormat:
-        @"T%u  %.1f%%  %@\n",
+        @"T%u %.1f%% %@\n",
 
         hot.thread,
-
         hot.cpu,
 
         BHFRunStateName(
@@ -737,9 +691,7 @@ static void BHFCollectStats(void)
              "OFFSET: +0x%llx\n",
 
             resolved.imageName,
-
             resolved.imageBase,
-
             resolved.imageOffset
         ];
 
@@ -758,7 +710,6 @@ static void BHFCollectStats(void)
                  "SYMBOL + OFFSET: +0x%llx\n",
 
                 resolved.symbolAddress,
-
                 resolved.symbolOffset
             ];
         }
@@ -793,24 +744,21 @@ static void BHFCollectStats(void)
         BHFThreadSample sample =
             samples[i];
 
-
         BHFResolvedAddress other =
             BHFResolveAddress(
                 sample.pc
             );
 
 
-        NSString *name =
+        NSString *image =
             other.found
                 ? other.imageName
                 : @"unknown";
-
 
         NSString *symbol =
             other.found
                 ? other.symbolName
                 : @"<none>";
-
 
         uint64_t offset =
             other.found
@@ -826,25 +774,20 @@ static void BHFCollectStats(void)
             (unsigned long)(i + 1),
 
             sample.thread,
-
             sample.cpu,
 
             BHFRunStateName(
                 sample.runState
             ),
 
-            name,
-
+            image,
             offset,
-
             symbol
         ];
     }
 
 
-    BHFUpdateOverlay(
-        output
-    );
+    BHFUpdateOverlay(output);
 }
 
 
@@ -873,10 +816,8 @@ static void BHFCollectStats(void)
                 BHFPreviousTime =
                     CACurrentMediaTime();
 
-
                 BHFPreviousCPUTime =
                     BHFProcessCPUTime();
-
 
                 BHFCreateOverlay();
 
@@ -897,3 +838,4 @@ static void BHFCollectStats(void)
         );
     }
 }
+```
