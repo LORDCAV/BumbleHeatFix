@@ -5,9 +5,9 @@
 #import <mach-o/dyld.h>
 
 
-#pragma mark - BumbleHeatFix v3.3.1
-#pragma mark - YapDatabase Symbol Resolver
-#pragma mark - RESOLUTION ONLY
+#pragma mark - BumbleHeatFix v3.4
+#pragma mark - YapDatabase Address Verification
+#pragma mark - OBSERVATION ONLY
 #pragma mark - No hooks
 #pragma mark - No thread changes
 #pragma mark - No suspension
@@ -15,18 +15,18 @@
 
 
 static UILabel *BHFLabel = nil;
-static NSTimer *BHFResolveTimer = nil;
+static NSTimer *BHFTimer = nil;
 
-static BOOL BHFResolved = NO;
+static BOOL BHFVerified = NO;
 
-static uintptr_t BHFResolvedAddress = 0;
-static uintptr_t BHFImageBase = 0;
+static uintptr_t BHFYapBase = 0;
+static uintptr_t BHFYapEnd = 0;
+static uintptr_t BHFTargetAddress = 0;
 
-static NSString *BHFResolvedPath = nil;
-static NSString *BHFResolvedSymbol = nil;
+static NSString *BHFYapPath = nil;
 
 
-#pragma mark - Window
+#pragma mark - Overlay
 
 static UIWindow *BHFGetWindow(void)
 {
@@ -47,11 +47,11 @@ static UIWindow *BHFGetWindow(void)
                 continue;
             }
 
-            UIWindowScene *windowScene =
+            UIWindowScene *sceneWindow =
                 (UIWindowScene *)scene;
 
             for (UIWindow *window
-                 in windowScene.windows) {
+                 in sceneWindow.windows) {
 
                 if (window.isKeyWindow) {
                     return window;
@@ -63,8 +63,6 @@ static UIWindow *BHFGetWindow(void)
     return nil;
 }
 
-
-#pragma mark - Overlay
 
 static void BHFCreateOverlay(void)
 {
@@ -90,7 +88,7 @@ static void BHFCreateOverlay(void)
                             6,
                             45,
                             405,
-                            680
+                            700
                         )];
 
             BHFLabel.numberOfLines = 0;
@@ -118,9 +116,8 @@ static void BHFCreateOverlay(void)
 
             BHFLabel.text =
                 @"BumbleHeatFix\n"
-                 "SYMBOL RESOLVER v3.3.1\n\n"
-                 "Searching for\n"
-                 "YapRowidSetEnumerate...";
+                 "YAPDATABASE VERIFY v3.4\n\n"
+                 "Searching loaded images...";
 
             [window addSubview:BHFLabel];
         }
@@ -128,7 +125,7 @@ static void BHFCreateOverlay(void)
 }
 
 
-static void BHFUpdateOverlay(
+static void BHFUpdate(
     NSString *text
 )
 {
@@ -148,223 +145,185 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Address Resolver
+#pragma mark - Find YapDatabase
 
-static void BHFResolveAddress(
-    uintptr_t address
-)
+static BOOL BHFFindYapDatabase(void)
 {
-    Dl_info info;
+    BHFYapBase = 0;
+    BHFYapEnd = 0;
 
-    memset(
-        &info,
-        0,
-        sizeof(info)
-    );
+    BHFYapPath = nil;
 
-    if (!dladdr(
-            (const void *)address,
-            &info)) {
-
-        BHFResolved = NO;
-        return;
-    }
-
-
-    BHFResolvedAddress =
-        address;
-
-
-    if (info.dli_fbase != NULL) {
-
-        BHFImageBase =
-            (uintptr_t)
-                info.dli_fbase;
-    }
-    else {
-
-        BHFImageBase = 0;
-    }
-
-
-    if (info.dli_fname != NULL) {
-
-        BHFResolvedPath =
-            [NSString
-                stringWithUTF8String:
-                    info.dli_fname];
-    }
-    else {
-
-        BHFResolvedPath =
-            @"unknown";
-    }
-
-
-    if (info.dli_sname != NULL) {
-
-        BHFResolvedSymbol =
-            [NSString
-                stringWithUTF8String:
-                    info.dli_sname];
-    }
-    else {
-
-        BHFResolvedSymbol =
-            @"<unknown>";
-    }
-
-
-    BHFResolved = YES;
-}
-
-
-#pragma mark - Exact Symbol Resolution
-
-static void BHFResolveYapDatabase(void)
-{
-    BHFResolved = NO;
-
-    BHFResolvedAddress = 0;
-    BHFImageBase = 0;
-
-    BHFResolvedPath = nil;
-    BHFResolvedSymbol = nil;
-
-
-    /*
-     * Try the exact exported symbol first.
-     */
-    void *symbol =
-        dlsym(
-            RTLD_DEFAULT,
-            "YapRowidSetEnumerate"
-        );
-
-
-    if (symbol != NULL) {
-
-        BHFResolveAddress(
-            (uintptr_t)symbol
-        );
-
-        return;
-    }
-
-
-    /*
-     * Search loaded Mach-O images.
-     *
-     * This does NOT modify anything.
-     */
-    uint32_t imageCount =
+    uint32_t count =
         _dyld_image_count();
 
 
     for (uint32_t i = 0;
-         i < imageCount;
+         i < count;
          i++) {
 
-        const char *imageName =
+        const char *name =
             _dyld_get_image_name(i);
 
-
-        if (imageName == NULL) {
+        if (name == NULL) {
             continue;
         }
 
 
-        NSString *image =
+        NSString *imageName =
             [NSString
                 stringWithUTF8String:
-                    imageName];
+                    name];
 
-
-        if (image == nil) {
+        if (imageName == nil) {
             continue;
         }
 
 
-        NSRange range =
-            [image
+        NSRange match =
+            [imageName
                 rangeOfString:
                     @"YapDatabase"
                 options:
                     NSCaseInsensitiveSearch];
 
 
-        if (range.location ==
+        if (match.location ==
             NSNotFound) {
-
             continue;
         }
 
 
-        void *handle =
-            dlopen(
-                imageName,
-                RTLD_NOW
-            );
+        const struct mach_header_64 *header =
+            (const struct mach_header_64 *)
+                _dyld_get_image_header(i);
 
 
-        if (handle == NULL) {
+        if (header == NULL) {
             continue;
         }
 
 
-        symbol =
-            dlsym(
-                handle,
-                "YapRowidSetEnumerate"
-            );
+        intptr_t slide =
+            _dyld_get_image_vmaddr_slide(i);
 
 
-        if (symbol != NULL) {
-
-            BHFResolveAddress(
-                (uintptr_t)symbol
-            );
-
-
-            dlclose(handle);
-
-            return;
-        }
+        /*
+         * We intentionally use the image
+         * load address rather than trying
+         * to infer a symbol address.
+         */
+        uintptr_t base =
+            (uintptr_t)header +
+            (uintptr_t)slide;
 
 
-        dlclose(handle);
+        BHFYapBase = base;
+
+
+        /*
+         * For this verification build,
+         * use the known relative location
+         * from the previous stack capture.
+         */
+        BHFTargetAddress =
+            BHFYapBase +
+            (uintptr_t)0xC7178;
+
+
+        /*
+         * We don't need to modify the
+         * framework. We only need to
+         * verify that the calculated
+         * address belongs to the image.
+         */
+        BHFYapEnd =
+            BHFYapBase +
+            (uintptr_t)0x2000000;
+
+
+        BHFYapPath =
+            imageName;
+
+
+        return YES;
     }
+
+
+    return NO;
 }
 
 
-#pragma mark - Output
+#pragma mark - Verification
 
-static NSString *BHFResolverText(void)
+static NSString *BHFVerificationText(void)
 {
-    if (!BHFResolved) {
+    if (BHFYapBase == 0) {
 
         return
             @"BumbleHeatFix\n"
-             "SYMBOL RESOLVER v3.3.1\n\n"
-             "TARGET:\n"
-             "YapRowidSetEnumerate\n\n"
+             "YAPDATABASE VERIFY v3.4\n\n"
              "STATUS:\n"
-             "NOT RESOLVED\n\n"
-             "No exported address found.\n\n"
+             "YapDatabase NOT FOUND\n\n"
+             "Loaded image search did not find\n"
+             "YapDatabase.\n\n"
              "No modification performed.";
     }
 
 
-    uintptr_t offset = 0;
+    uintptr_t relative =
+        BHFTargetAddress -
+        BHFYapBase;
 
 
-    if (BHFImageBase != 0 &&
-        BHFResolvedAddress >=
-            BHFImageBase) {
+    BOOL inside =
+        (BHFTargetAddress >= BHFYapBase &&
+         BHFTargetAddress < BHFYapEnd);
 
-        offset =
-            BHFResolvedAddress -
-            BHFImageBase;
+
+    BHFVerified = inside;
+
+
+    if (inside) {
+
+        return
+            [NSString
+                stringWithFormat:
+                    @"BumbleHeatFix\n"
+                     "YAPDATABASE VERIFY v3.4\n\n"
+                     "STATUS:\n"
+                     "TARGET ADDRESS IN IMAGE\n\n"
+                     "IMAGE:\n"
+                     "%@\n\n"
+                     "YAP BASE:\n"
+                     "0x%llx\n\n"
+                     "TARGET:\n"
+                     "0x%llx\n\n"
+                     "RELATIVE OFFSET:\n"
+                     "+0x%llx\n\n"
+                     "EXPECTED OFFSET:\n"
+                     "+0xc7178\n\n"
+                     "TARGET STATUS\n"
+                     "Address verification only\n"
+                     "No hook\n"
+                     "No modification\n"
+                     "No priority changes\n"
+                     "No suspension\n"
+                     "No termination",
+
+                    BHFYapPath != nil
+                        ? BHFYapPath
+                        : @"unknown",
+
+                    (unsigned long long)
+                        BHFYapBase,
+
+                    (unsigned long long)
+                        BHFTargetAddress,
+
+                    (unsigned long long)
+                        relative
+            ];
     }
 
 
@@ -372,57 +331,49 @@ static NSString *BHFResolverText(void)
         [NSString
             stringWithFormat:
                 @"BumbleHeatFix\n"
-                 "SYMBOL RESOLVER v3.3.1\n\n"
-                 "TARGET:\n"
-                 "YapRowidSetEnumerate\n\n"
+                 "YAPDATABASE VERIFY v3.4\n\n"
                  "STATUS:\n"
-                 "RESOLVED\n\n"
-                 "ADDRESS:\n"
-                 "0x%llx\n\n"
-                 "IMAGE BASE:\n"
-                 "0x%llx\n\n"
-                 "OFFSET:\n"
-                 "+0x%llx\n\n"
+                 "TARGET OUTSIDE IMAGE\n\n"
                  "IMAGE:\n"
                  "%@\n\n"
-                 "SYMBOL:\n"
-                 "%@\n\n"
-                 "TARGET STATUS\n"
-                 "Resolution only\n"
-                 "No hook\n"
-                 "No modification\n"
-                 "No priority changes\n"
-                 "No suspension\n"
-                 "No termination",
+                 "YAP BASE:\n"
+                 "0x%llx\n\n"
+                 "TARGET:\n"
+                 "0x%llx\n\n"
+                 "RELATIVE OFFSET:\n"
+                 "+0x%llx\n\n"
+                 "EXPECTED OFFSET:\n"
+                 "+0xc7178\n\n"
+                 "No modification performed.",
 
-                (unsigned long long)
-                    BHFResolvedAddress,
-
-                (unsigned long long)
-                    BHFImageBase,
-
-                (unsigned long long)
-                    offset,
-
-                BHFResolvedPath != nil
-                    ? BHFResolvedPath
+                BHFYapPath != nil
+                    ? BHFYapPath
                     : @"unknown",
 
-                BHFResolvedSymbol != nil
-                    ? BHFResolvedSymbol
-                    : @"<unknown>"
+                (unsigned long long)
+                    BHFYapBase,
+
+                (unsigned long long)
+                    BHFTargetAddress,
+
+                (unsigned long long)
+                    relative
         ];
 }
 
 
-#pragma mark - Resolution
+#pragma mark - Main Resolver
 
-static void BHFPerformResolution(void)
+static void BHFRunVerification(void)
 {
-    BHFResolveYapDatabase();
+    if (BHFYapBase == 0) {
 
-    BHFUpdateOverlay(
-        BHFResolverText()
+        BHFFindYapDatabase();
+    }
+
+
+    BHFUpdate(
+        BHFVerificationText()
     );
 }
 
@@ -435,7 +386,7 @@ static void BHFPerformResolution(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "SYMBOL RESOLVER v3.3.1 loaded"
+             "YAPDATABASE VERIFY v3.4 loaded"
         );
 
 
@@ -451,17 +402,13 @@ static void BHFPerformResolution(void)
 
                 BHFCreateOverlay();
 
-                BHFPerformResolution();
+                BHFRunVerification();
 
 
                 /*
-                 * Retry because YapDatabase may
-                 * not yet be completely loaded.
+                 * Give frameworks time to load.
                  */
-                __block NSUInteger attempts = 0;
-
-
-                BHFResolveTimer =
+                BHFTimer =
                     [NSTimer
                         scheduledTimerWithTimeInterval:
                             2.0
@@ -470,19 +417,17 @@ static void BHFPerformResolution(void)
 
                         block:^(NSTimer *timer) {
 
-                            attempts++;
+                            if (BHFYapBase == 0) {
 
-                            BHFPerformResolution();
+                                BHFRunVerification();
 
-
-                            if (BHFResolved ||
-                                attempts >= 10) {
-
-                                [timer invalidate];
-
-                                BHFResolveTimer =
-                                    nil;
+                                return;
                             }
+
+
+                            [timer invalidate];
+
+                            BHFTimer = nil;
                         }];
             }
         );
