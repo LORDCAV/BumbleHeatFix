@@ -1,14 +1,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
-#import <dlfcn.h>
 #import <mach-o/dyld.h>
 
 
-#pragma mark - BumbleHeatFix v3.4
-#pragma mark - YapDatabase Address Verification
-#pragma mark - OBSERVATION ONLY
+#pragma mark - BumbleHeatFix v3.5
+#pragma mark - YapDatabase Instruction Inspector
+#pragma mark - READ ONLY
 #pragma mark - No hooks
+#pragma mark - No patches
 #pragma mark - No thread changes
 #pragma mark - No suspension
 #pragma mark - No termination
@@ -17,16 +17,16 @@
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFTimer = nil;
 
-static BOOL BHFVerified = NO;
-
 static uintptr_t BHFYapBase = 0;
-static uintptr_t BHFYapEnd = 0;
-static uintptr_t BHFTargetAddress = 0;
+static uintptr_t BHFTarget = 0;
 
 static NSString *BHFYapPath = nil;
 
+static uint32_t BHFInstructions[8];
+static BOOL BHFInstructionRead = NO;
 
-#pragma mark - Overlay
+
+#pragma mark - Window
 
 static UIWindow *BHFGetWindow(void)
 {
@@ -63,6 +63,8 @@ static UIWindow *BHFGetWindow(void)
     return nil;
 }
 
+
+#pragma mark - Overlay
 
 static void BHFCreateOverlay(void)
 {
@@ -116,8 +118,8 @@ static void BHFCreateOverlay(void)
 
             BHFLabel.text =
                 @"BumbleHeatFix\n"
-                 "YAPDATABASE VERIFY v3.4\n\n"
-                 "Searching loaded images...";
+                 "INSTRUCTION INSPECTOR v3.5\n\n"
+                 "Locating YapDatabase...";
 
             [window addSubview:BHFLabel];
         }
@@ -149,11 +151,6 @@ static void BHFUpdate(
 
 static BOOL BHFFindYapDatabase(void)
 {
-    BHFYapBase = 0;
-    BHFYapEnd = 0;
-
-    BHFYapPath = nil;
-
     uint32_t count =
         _dyld_image_count();
 
@@ -190,6 +187,7 @@ static BOOL BHFFindYapDatabase(void)
 
         if (match.location ==
             NSNotFound) {
+
             continue;
         }
 
@@ -209,37 +207,20 @@ static BOOL BHFFindYapDatabase(void)
 
 
         /*
-         * We intentionally use the image
-         * load address rather than trying
-         * to infer a symbol address.
+         * Runtime image address.
          */
-        uintptr_t base =
+        BHFYapBase =
             (uintptr_t)header +
             (uintptr_t)slide;
 
 
-        BHFYapBase = base;
-
-
         /*
-         * For this verification build,
-         * use the known relative location
-         * from the previous stack capture.
+         * Target obtained from our verified
+         * framework-relative offset.
          */
-        BHFTargetAddress =
+        BHFTarget =
             BHFYapBase +
             (uintptr_t)0xC7178;
-
-
-        /*
-         * We don't need to modify the
-         * framework. We only need to
-         * verify that the calculated
-         * address belongs to the image.
-         */
-        BHFYapEnd =
-            BHFYapBase +
-            (uintptr_t)0x2000000;
 
 
         BHFYapPath =
@@ -254,62 +235,146 @@ static BOOL BHFFindYapDatabase(void)
 }
 
 
-#pragma mark - Verification
+#pragma mark - Instruction Read
 
-static NSString *BHFVerificationText(void)
+static BOOL BHFReadInstructions(void)
+{
+    if (BHFTarget == 0) {
+        return NO;
+    }
+
+
+    /*
+     * ARM64 instructions are 4-byte aligned.
+     */
+    if ((BHFTarget & 0x3) != 0) {
+        return NO;
+    }
+
+
+    /*
+     * Read only the first eight 32-bit
+     * instruction words.
+     *
+     * No instruction is executed.
+     */
+    const uint32_t *code =
+        (const uint32_t *)
+            BHFTarget;
+
+
+    for (NSUInteger i = 0;
+         i < 8;
+         i++) {
+
+        BHFInstructions[i] =
+            code[i];
+    }
+
+
+    BHFInstructionRead = YES;
+
+    return YES;
+}
+
+
+#pragma mark - Instruction Classification
+
+static NSString *BHFInstructionHint(
+    uint32_t instruction
+)
+{
+    /*
+     * ARM64 common function prologue:
+     *
+     * STP X29, X30, [SP, #imm]!
+     *
+     * Encoding family:
+     * 0xA9...
+     */
+    if ((instruction & 0xFFC00000) ==
+        0xA9800000) {
+
+        return @"possible STP prologue";
+    }
+
+
+    /*
+     * MOV X29, SP
+     */
+    if (instruction == 0x910003FD) {
+
+        return @"MOV X29, SP";
+    }
+
+
+    /*
+     * RET
+     */
+    if (instruction == 0xD65F03C0) {
+
+        return @"RET";
+    }
+
+
+    /*
+     * NOP
+     */
+    if (instruction == 0xD503201F) {
+
+        return @"NOP";
+    }
+
+
+    /*
+     * Generic ARM64 branch.
+     */
+    if ((instruction & 0x7C000000) ==
+        0x14000000) {
+
+        return @"branch";
+    }
+
+
+    return @"unknown";
+}
+
+
+#pragma mark - Output
+
+static NSString *BHFOutput(void)
 {
     if (BHFYapBase == 0) {
 
         return
             @"BumbleHeatFix\n"
-             "YAPDATABASE VERIFY v3.4\n\n"
+             "INSTRUCTION INSPECTOR v3.5\n\n"
              "STATUS:\n"
              "YapDatabase NOT FOUND\n\n"
-             "Loaded image search did not find\n"
-             "YapDatabase.\n\n"
              "No modification performed.";
     }
 
 
-    uintptr_t relative =
-        BHFTargetAddress -
-        BHFYapBase;
-
-
-    BOOL inside =
-        (BHFTargetAddress >= BHFYapBase &&
-         BHFTargetAddress < BHFYapEnd);
-
-
-    BHFVerified = inside;
-
-
-    if (inside) {
+    if (!BHFInstructionRead) {
 
         return
             [NSString
                 stringWithFormat:
                     @"BumbleHeatFix\n"
-                     "YAPDATABASE VERIFY v3.4\n\n"
+                     "INSTRUCTION INSPECTOR v3.5\n\n"
                      "STATUS:\n"
-                     "TARGET ADDRESS IN IMAGE\n\n"
+                     "TARGET LOCATED\n\n"
                      "IMAGE:\n"
                      "%@\n\n"
                      "YAP BASE:\n"
                      "0x%llx\n\n"
                      "TARGET:\n"
                      "0x%llx\n\n"
-                     "RELATIVE OFFSET:\n"
-                     "+0x%llx\n\n"
-                     "EXPECTED OFFSET:\n"
+                     "OFFSET:\n"
                      "+0xc7178\n\n"
-                     "TARGET STATUS\n"
-                     "Address verification only\n"
-                     "No hook\n"
-                     "No modification\n"
-                     "No priority changes\n"
-                     "No suspension\n"
-                     "No termination",
+                     "INSTRUCTION READ:\n"
+                     "FAILED\n\n"
+                     "No modification performed.",
 
                     BHFYapPath != nil
                         ? BHFYapPath
@@ -319,32 +384,27 @@ static NSString *BHFVerificationText(void)
                         BHFYapBase,
 
                     (unsigned long long)
-                        BHFTargetAddress,
-
-                    (unsigned long long)
-                        relative
+                        BHFTarget
             ];
     }
 
 
-    return
-        [NSString
+    NSMutableString *text =
+        [NSMutableString
             stringWithFormat:
                 @"BumbleHeatFix\n"
-                 "YAPDATABASE VERIFY v3.4\n\n"
+                 "INSTRUCTION INSPECTOR v3.5\n\n"
                  "STATUS:\n"
-                 "TARGET OUTSIDE IMAGE\n\n"
+                 "TARGET INSPECTED\n\n"
                  "IMAGE:\n"
                  "%@\n\n"
                  "YAP BASE:\n"
                  "0x%llx\n\n"
                  "TARGET:\n"
                  "0x%llx\n\n"
-                 "RELATIVE OFFSET:\n"
-                 "+0x%llx\n\n"
-                 "EXPECTED OFFSET:\n"
+                 "OFFSET:\n"
                  "+0xc7178\n\n"
-                 "No modification performed.",
+                 "ARM64 WORDS:\n",
 
                 BHFYapPath != nil
                     ? BHFYapPath
@@ -354,26 +414,73 @@ static NSString *BHFVerificationText(void)
                     BHFYapBase,
 
                 (unsigned long long)
-                    BHFTargetAddress,
-
-                (unsigned long long)
-                    relative
+                    BHFTarget
         ];
+
+
+    for (NSUInteger i = 0;
+         i < 8;
+         i++) {
+
+        NSString *hint =
+            BHFInstructionHint(
+                BHFInstructions[i]
+            );
+
+
+        [text appendFormat:
+            @"\n+0x%02llx  0x%08x  %@",
+
+            (unsigned long long)
+                (i * 4),
+
+            BHFInstructions[i],
+
+            hint
+        ];
+    }
+
+
+    [text appendString:
+        @"\n\n"
+         "TARGET STATUS\n"
+         "Read-only inspection\n"
+         "No hook\n"
+         "No patch\n"
+         "No priority changes\n"
+         "No suspension\n"
+         "No termination"];
+
+
+    return text;
 }
 
 
-#pragma mark - Main Resolver
+#pragma mark - Run
 
-static void BHFRunVerification(void)
+static void BHFInspect(void)
 {
     if (BHFYapBase == 0) {
 
-        BHFFindYapDatabase();
+        if (!BHFFindYapDatabase()) {
+
+            BHFUpdate(
+                BHFOutput()
+            );
+
+            return;
+        }
+    }
+
+
+    if (!BHFInstructionRead) {
+
+        BHFReadInstructions();
     }
 
 
     BHFUpdate(
-        BHFVerificationText()
+        BHFOutput()
     );
 }
 
@@ -386,7 +493,7 @@ static void BHFRunVerification(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "YAPDATABASE VERIFY v3.4 loaded"
+             "INSTRUCTION INSPECTOR v3.5 loaded"
         );
 
 
@@ -402,11 +509,12 @@ static void BHFRunVerification(void)
 
                 BHFCreateOverlay();
 
-                BHFRunVerification();
+                BHFInspect();
 
 
                 /*
-                 * Give frameworks time to load.
+                 * Retry only while the framework
+                 * hasn't appeared yet.
                  */
                 BHFTimer =
                     [NSTimer
@@ -419,7 +527,7 @@ static void BHFRunVerification(void)
 
                             if (BHFYapBase == 0) {
 
-                                BHFRunVerification();
+                                BHFInspect();
 
                                 return;
                             }
