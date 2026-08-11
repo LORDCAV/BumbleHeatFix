@@ -5,9 +5,7 @@
 #import <mach/mach.h>
 #import <mach/thread_info.h>
 #import <mach/thread_act.h>
-#import <mach/arm/thread_status.h>
 
-#import <dlfcn.h>
 #include <stdint.h>
 
 static UILabel *BHFLabel = nil;
@@ -19,7 +17,14 @@ static CFTimeInterval BHFPreviousTime = 0.0;
 static double BHFCPUPercent = 0.0;
 static double BHFPeakCPU = 0.0;
 
-#define BHF_MAX_THREADS 6
+static BOOL BHFGovernorEnabled = YES;
+static thread_t BHFGovernorThread = MACH_PORT_NULL;
+static CFTimeInterval BHFGovernorStartTime = 0.0;
+static NSUInteger BHFHotSamples = 0;
+
+#define BHF_HOT_THRESHOLD 85.0
+#define BHF_REQUIRED_HOT_SAMPLES 3
+#define BHF_GOVERNOR_DURATION 5.0
 
 
 #pragma mark - Window
@@ -92,7 +97,7 @@ static NSString *BHFRunStateName(integer_t state)
 }
 
 
-#pragma mark - Process CPU
+#pragma mark - CPU
 
 static double BHFProcessCPUTime(void)
 {
@@ -166,45 +171,7 @@ typedef struct {
     thread_t thread;
     double cpu;
     integer_t runState;
-    uint64_t pc;
 } BHFThreadSample;
-
-
-#pragma mark - Get Thread PC
-
-static BOOL BHFGetThreadPC(
-    thread_t thread,
-    uint64_t *pcOut
-)
-{
-    if (pcOut == NULL) {
-        return NO;
-    }
-
-    *pcOut = 0;
-
-    arm_thread_state64_t state;
-
-    mach_msg_type_number_t count =
-        ARM_THREAD_STATE64_COUNT;
-
-    kern_return_t kr =
-        thread_get_state(
-            thread,
-            ARM_THREAD_STATE64,
-            (thread_state_t)&state,
-            &count
-        );
-
-    if (kr != KERN_SUCCESS) {
-        return NO;
-    }
-
-    *pcOut =
-        arm_thread_state64_get_pc(state);
-
-    return YES;
-}
 
 
 #pragma mark - Collect Threads
@@ -267,14 +234,8 @@ static NSUInteger BHFCollectThreads(
         BHFThreadSample sample = {
             threadList[i],
             cpu,
-            info.run_state,
-            0
+            info.run_state
         };
-
-        BHFGetThreadPC(
-            threadList[i],
-            &sample.pc
-        );
 
         temp[tempCount++] = sample;
     }
@@ -307,7 +268,6 @@ static NSUInteger BHFCollectThreads(
     NSUInteger resultCount =
         MIN(tempCount, maximum);
 
-
     for (NSUInteger i = 0;
          i < resultCount;
          i++) {
@@ -327,125 +287,149 @@ static NSUInteger BHFCollectThreads(
 }
 
 
-#pragma mark - Address Resolver
+#pragma mark - Soft Governor
 
-typedef struct {
-    BOOL found;
-
-    NSString *imageName;
-    NSString *imagePath;
-    NSString *symbolName;
-
-    uint64_t imageBase;
-    uint64_t symbolAddress;
-
-    uint64_t imageOffset;
-    uint64_t symbolOffset;
-} BHFResolvedAddress;
-
-
-static BHFResolvedAddress
-BHFResolveAddress(uint64_t address)
+static BOOL BHFLowerThreadPriority(
+    thread_t thread
+)
 {
+    if (thread == MACH_PORT_NULL) {
+        return NO;
+    }
+
     /*
-     * Do not use memset() on this structure.
-     * It contains Objective-C object pointers.
+     * THREAD_PRECEDENCE_POLICY changes scheduling
+     * importance without suspending the thread.
      */
 
-    BHFResolvedAddress result = {
-        NO,
-        nil,
-        nil,
-        nil,
-        0,
-        0,
-        0,
-        0
-    };
+    thread_precedence_policy_data_t policy;
 
-    if (address == 0) {
-        return result;
-    }
+    policy.importance = -10;
 
-    Dl_info info = {0};
+    mach_msg_type_number_t count =
+        THREAD_PRECEDENCE_POLICY_COUNT;
 
-    int success =
-        dladdr(
-            (const void *)(uintptr_t)address,
-            &info
+    kern_return_t kr =
+        thread_policy_set(
+            thread,
+            THREAD_PRECEDENCE_POLICY,
+            (thread_policy_t)&policy,
+            count
         );
 
-    if (!success) {
-        return result;
+    if (kr != KERN_SUCCESS) {
+        return NO;
     }
 
-    result.found = YES;
+    return YES;
+}
 
 
-    if (info.dli_fname != NULL) {
+static BOOL BHFRestoreThreadPriority(
+    thread_t thread
+)
+{
+    if (thread == MACH_PORT_NULL) {
+        return NO;
+    }
 
-        result.imagePath =
-            [NSString stringWithUTF8String:
-                info.dli_fname];
+    thread_precedence_policy_data_t policy;
 
-        if (result.imagePath != nil) {
+    policy.importance = 0;
 
-            result.imageName =
-                [result.imagePath lastPathComponent];
+    mach_msg_type_number_t count =
+        THREAD_PRECEDENCE_POLICY_COUNT;
+
+    kern_return_t kr =
+        thread_policy_set(
+            thread,
+            THREAD_PRECEDENCE_POLICY,
+            (thread_policy_t)&policy,
+            count
+        );
+
+    if (kr != KERN_SUCCESS) {
+        return NO;
+    }
+
+    return YES;
+}
+
+
+static void BHFGovernorTick(
+    BHFThreadSample hot
+)
+{
+    if (!BHFGovernorEnabled) {
+        return;
+    }
+
+
+    CFTimeInterval now =
+        CACurrentMediaTime();
+
+
+    /*
+     * Restore the previously governed thread.
+     */
+
+    if (BHFGovernorThread != MACH_PORT_NULL) {
+
+        if ((now - BHFGovernorStartTime) >=
+            BHF_GOVERNOR_DURATION) {
+
+            BHFRestoreThreadPriority(
+                BHFGovernorThread
+            );
+
+            BHFGovernorThread =
+                MACH_PORT_NULL;
+
+            BHFGovernorStartTime =
+                0.0;
         }
     }
 
-    if (result.imageName == nil) {
-        result.imageName = @"unknown";
+
+    /*
+     * Only consider a thread that is
+     * actually consuming substantial CPU.
+     */
+
+    if (hot.cpu >= BHF_HOT_THRESHOLD) {
+
+        BHFHotSamples++;
+
+    } else {
+
+        BHFHotSamples = 0;
     }
 
 
-    if (info.dli_fbase != NULL) {
+    /*
+     * Require several consecutive samples
+     * before changing scheduling priority.
+     */
 
-        result.imageBase =
-            (uint64_t)(uintptr_t)
-                info.dli_fbase;
+    if (BHFHotSamples >=
+        BHF_REQUIRED_HOT_SAMPLES) {
+
+        if (BHFGovernorThread ==
+            MACH_PORT_NULL) {
+
+            if (BHFLowerThreadPriority(
+                    hot.thread)) {
+
+                BHFGovernorThread =
+                    hot.thread;
+
+                BHFGovernorStartTime =
+                    now;
+            }
+
+            BHFHotSamples = 0;
+        }
     }
-
-
-    if (info.dli_sname != NULL) {
-
-        result.symbolName =
-            [NSString stringWithUTF8String:
-                info.dli_sname];
-    }
-
-    if (result.symbolName == nil) {
-        result.symbolName = @"<no symbol>";
-    }
-
-
-    if (info.dli_saddr != NULL) {
-
-        result.symbolAddress =
-            (uint64_t)(uintptr_t)
-                info.dli_saddr;
-    }
-
-
-    if (result.imageBase != 0 &&
-        address >= result.imageBase) {
-
-        result.imageOffset =
-            address -
-            result.imageBase;
-    }
-
-
-    if (result.symbolAddress != 0 &&
-        address >= result.symbolAddress) {
-
-        result.symbolOffset =
-            address -
-            result.symbolAddress;
-    }
-
-    return result;
 }
 
 
@@ -475,7 +459,7 @@ static void BHFCreateOverlay(void)
                         6,
                         45,
                         405,
-                        700
+                        500
                     )];
 
         BHFLabel.numberOfLines = 0;
@@ -485,7 +469,7 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.font =
             [UIFont
-                monospacedSystemFontOfSize:9.0
+                monospacedSystemFontOfSize:10.0
                 weight:UIFontWeightMedium];
 
         BHFLabel.textColor =
@@ -495,15 +479,19 @@ static void BHFCreateOverlay(void)
             [[UIColor blackColor]
                 colorWithAlphaComponent:0.90];
 
-        BHFLabel.layer.cornerRadius = 8.0;
-        BHFLabel.layer.masksToBounds = YES;
+        BHFLabel.layer.cornerRadius =
+            8.0;
+
+        BHFLabel.layer.masksToBounds =
+            YES;
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "SYMBOL RESOLVER v2.8\n\n"
+             "SOFT GOVERNOR v2.9\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
-             "Resolving hottest thread...";
+             "Governor: ON\n"
+             "Hot samples: 0";
 
         [window addSubview:BHFLabel];
     });
@@ -576,17 +564,25 @@ static void BHFCollectStats(void)
     }
 
 
-    BHFThreadSample samples[
-        BHF_MAX_THREADS];
+    BHFThreadSample samples[6];
 
     NSUInteger count =
         BHFCollectThreads(
             samples,
-            BHF_MAX_THREADS
+            6
         );
+
 
     NSUInteger memory =
         BHFMemoryMB();
+
+
+    if (count > 0) {
+
+        BHFGovernorTick(
+            samples[0]
+        );
+    }
 
 
     NSMutableString *output =
@@ -595,14 +591,20 @@ static void BHFCollectStats(void)
 
     [output appendFormat:
         @"BumbleHeatFix\n"
-         "SYMBOL RESOLVER v2.8\n\n"
+         "SOFT GOVERNOR v2.9\n\n"
          "CPU: %.1f%%\n"
          "Peak: %.1f%%\n"
-         "Memory: %lu MB\n\n",
+         "Memory: %lu MB\n"
+         "Governor: %@\n"
+         "Hot samples: %lu\n\n",
 
         BHFCPUPercent,
         BHFPeakCPU,
-        (unsigned long)memory
+        (BHFGovernorEnabled
+            ? @"ON"
+            : @"OFF"),
+
+        (unsigned long)BHFHotSamples
     ];
 
 
@@ -620,18 +622,10 @@ static void BHFCollectStats(void)
     BHFThreadSample hot =
         samples[0];
 
-    BHFResolvedAddress resolved =
-        BHFResolveAddress(
-            hot.pc
-        );
-
-
-    [output appendString:
-        @"HOT THREAD\n"];
-
 
     [output appendFormat:
-        @"T%u %.1f%% %@\n",
+        @"HOT THREAD\n"
+         "T%u %.1f%% %@\n",
 
         hot.thread,
         hot.cpu,
@@ -642,60 +636,22 @@ static void BHFCollectStats(void)
     ];
 
 
-    [output appendFormat:
-        @"PC: 0x%llx\n",
-
-        hot.pc
-    ];
-
-
-    if (resolved.found) {
+    if (BHFGovernorThread !=
+        MACH_PORT_NULL) {
 
         [output appendFormat:
-            @"IMAGE: %@\n"
-             "BASE: 0x%llx\n"
-             "OFFSET: +0x%llx\n",
+            @"\nGOVERNED THREAD\n"
+             "T%u\n"
+             "Priority: LOWERED\n",
 
-            resolved.imageName,
-            resolved.imageBase,
-            resolved.imageOffset
+            BHFGovernorThread
         ];
 
-
-        [output appendFormat:
-            @"SYMBOL: %@\n",
-
-            resolved.symbolName
-        ];
-
-
-        if (resolved.symbolAddress != 0) {
-
-            [output appendFormat:
-                @"SYMBOL ADDR: 0x%llx\n"
-                 "SYMBOL + OFFSET: +0x%llx\n",
-
-                resolved.symbolAddress,
-                resolved.symbolOffset
-            ];
-        }
-
-
-        if (resolved.imagePath != nil) {
-
-            [output appendFormat:
-                @"PATH:\n%@\n",
-
-                resolved.imagePath
-            ];
-        }
-
-    }
-    else {
+    } else {
 
         [output appendString:
-            @"IMAGE: <unresolved>\n"
-             "SYMBOL: <unresolved>\n"];
+            @"\nGOVERNED THREAD\n"
+             "None\n"];
     }
 
 
@@ -710,32 +666,8 @@ static void BHFCollectStats(void)
         BHFThreadSample sample =
             samples[i];
 
-        BHFResolvedAddress other =
-            BHFResolveAddress(
-                sample.pc
-            );
-
-
-        NSString *image =
-            other.found
-                ? other.imageName
-                : @"unknown";
-
-        NSString *symbol =
-            other.found
-                ? other.symbolName
-                : @"<none>";
-
-        uint64_t offset =
-            other.found
-                ? other.imageOffset
-                : 0;
-
-
         [output appendFormat:
-            @"%lu. T%u %.1f%% %@\n"
-             "    %@ + 0x%llx\n"
-             "    %@\n",
+            @"%lu. T%u %.1f%% %@\n",
 
             (unsigned long)(i + 1),
 
@@ -744,11 +676,7 @@ static void BHFCollectStats(void)
 
             BHFRunStateName(
                 sample.runState
-            ),
-
-            image,
-            offset,
-            symbol
+            )
         ];
     }
 
@@ -765,7 +693,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Symbol Resolver v2.8 loaded"
+             "Soft Governor v2.9 loaded"
         );
 
 
@@ -784,6 +712,7 @@ static void BHFCollectStats(void)
 
                 BHFPreviousCPUTime =
                     BHFProcessCPUTime();
+
 
                 BHFCreateOverlay();
 
