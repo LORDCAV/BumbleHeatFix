@@ -17,14 +17,21 @@ static double BHFPeakCPUPercent = 0.0;
 
 static BOOL BHFIdleMode = NO;
 
-static NSUInteger BHFTrackedThreads = 0;
-static NSUInteger BHFSuccessfulChanges = 0;
-static NSUInteger BHFFailedChanges = 0;
-
 #define BHF_IDLE_DELAY 15.0
 #define BHF_CPU_TRIGGER 70.0
 #define BHF_THREAD_TRIGGER 20.0
 #define BHF_MAX_TRACKED 32
+
+typedef struct {
+    thread_t thread;
+    BOOL modified;
+} BHFTrackedThread;
+
+static BHFTrackedThread BHFThreads[ BHF_MAX_TRACKED ];
+static NSUInteger BHFTrackedCount = 0;
+
+static NSUInteger BHFSuccessfulChanges = 0;
+static NSUInteger BHFFailedChanges = 0;
 
 
 #pragma mark - Window
@@ -136,7 +143,7 @@ static NSUInteger BHFMemoryMB(void)
 }
 
 
-#pragma mark - Thread Priority
+#pragma mark - Lower Thread Priority
 
 static BOOL BHFLowerThreadPriority(thread_t thread)
 {
@@ -156,6 +163,8 @@ static BOOL BHFLowerThreadPriority(thread_t thread)
 }
 
 
+#pragma mark - Restore Thread Priority
+
 static BOOL BHFRestoreThreadPriority(thread_t thread)
 {
     thread_precedence_policy_data_t policy;
@@ -174,26 +183,43 @@ static BOOL BHFRestoreThreadPriority(thread_t thread)
 }
 
 
-#pragma mark - Restore
+#pragma mark - Restore Modified Threads
 
 static void BHFRestoreThreads(void)
 {
-    /*
-     * We intentionally don't keep Mach ports around
-     * indefinitely. This function currently exists as
-     * a safe state reset point.
-     */
+    NSUInteger restored = 0;
 
-    BHFTrackedThreads = 0;
+    for (NSUInteger i = 0;
+         i < BHFTrackedCount;
+         i++) {
+
+        if (!BHFThreads[i].modified) {
+            continue;
+        }
+
+        if (BHFThreads[i].thread ==
+            MACH_PORT_NULL) {
+            continue;
+        }
+
+        if (BHFRestoreThreadPriority(
+                BHFThreads[i].thread)) {
+
+            restored++;
+        }
+    }
 
     NSLog(
         @"[BumbleHeatFix] "
-         "Thread priority restoration requested"
+         "Restored %lu thread priorities",
+         (unsigned long)restored
     );
+
+    BHFTrackedCount = 0;
 }
 
 
-#pragma mark - Apply Governor
+#pragma mark - Governor
 
 static void BHFApplyGovernor(void)
 {
@@ -233,9 +259,16 @@ static void BHFApplyGovernor(void)
     NSUInteger changed = 0;
     NSUInteger failed = 0;
 
+
     for (NSUInteger i = 0;
          i < threadCount;
          i++) {
+
+        if (BHFTrackedCount >=
+            BHF_MAX_TRACKED) {
+
+            break;
+        }
 
         thread_basic_info_data_t info;
 
@@ -254,13 +287,15 @@ static void BHFApplyGovernor(void)
             continue;
         }
 
+
         double threadCPU =
             ((double)info.cpu_usage /
              (double)TH_USAGE_SCALE) *
             100.0;
 
+
         /*
-         * Only consider genuinely busy threads.
+         * Only touch genuinely busy threads.
          */
 
         if (threadCPU <
@@ -269,8 +304,49 @@ static void BHFApplyGovernor(void)
             continue;
         }
 
+
+        /*
+         * Don't modify the same thread
+         * repeatedly.
+         */
+
+        BOOL alreadyTracked = NO;
+
+        for (NSUInteger j = 0;
+             j < BHFTrackedCount;
+             j++) {
+
+            if (BHFThreads[j].thread ==
+                threadList[i]) {
+
+                alreadyTracked = YES;
+                break;
+            }
+        }
+
+        if (alreadyTracked) {
+            continue;
+        }
+
+
+        /*
+         * Attempt mild priority reduction.
+         */
+
         if (BHFLowerThreadPriority(
                 threadList[i])) {
+
+            BHFThreads[
+                BHFTrackedCount
+            ].thread =
+                threadList[i];
+
+            BHFThreads[
+                BHFTrackedCount
+            ].modified =
+                YES;
+
+            BHFTrackedCount++;
 
             changed++;
 
@@ -278,27 +354,24 @@ static void BHFApplyGovernor(void)
 
             failed++;
         }
-
-        if (changed >=
-            BHF_MAX_TRACKED) {
-
-            break;
-        }
     }
 
-    BHFSuccessfulChanges += changed;
-    BHFFailedChanges += failed;
 
-    BHFTrackedThreads =
+    BHFSuccessfulChanges +=
         changed;
+
+    BHFFailedChanges +=
+        failed;
+
 
     NSLog(
         @"[BumbleHeatFix] "
-         "Governor attempt: "
+         "Governor: "
          "%lu changed, %lu failed",
          (unsigned long)changed,
          (unsigned long)failed
     );
+
 
     vm_deallocate(
         mach_task_self(),
@@ -360,11 +433,12 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "EXPERIMENT v2.1\n\n"
+             "EXPERIMENT v2.2\n\n"
              "CPU: measuring...\n"
              "Idle timer: starting...\n"
              "Governor: OFF\n\n"
-             "Changed: 0\n"
+             "Tracked: 0\n"
+             "Successful: 0\n"
              "Failed: 0";
 
         [window addSubview:BHFLabel];
@@ -415,7 +489,7 @@ static void BHFUpdateOverlay(NSString *text)
                 NSLog(
                     @"[BumbleHeatFix] "
                      "Touch detected - "
-                     "leaving governor mode"
+                     "governor OFF"
                 );
             }
         }
@@ -437,8 +511,9 @@ static void BHFCollectStats(void)
     double currentCPU =
         BHFProcessCPUTime();
 
+
     /*
-     * CPU calculation.
+     * CPU percentage.
      */
 
     if (BHFPreviousTime > 0.0 &&
@@ -446,7 +521,8 @@ static void BHFCollectStats(void)
         currentCPU >= BHFPreviousCPUTime) {
 
         double elapsed =
-            now - BHFPreviousTime;
+            now -
+            BHFPreviousTime;
 
         double delta =
             currentCPU -
@@ -459,6 +535,7 @@ static void BHFCollectStats(void)
                 100.0;
         }
     }
+
 
     BHFPreviousTime =
         now;
@@ -476,7 +553,7 @@ static void BHFCollectStats(void)
 
 
     /*
-     * Idle timer.
+     * Calculate idle duration.
      */
 
     double idleTime =
@@ -485,7 +562,8 @@ static void BHFCollectStats(void)
 
 
     /*
-     * Enter governor mode.
+     * Enter governor after
+     * 15 seconds without touch.
      */
 
     if (!BHFIdleMode &&
@@ -495,12 +573,12 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "IDLE THRESHOLD REACHED"
+             "GOVERNOR ON"
         );
 
         NSLog(
             @"[BumbleHeatFix] "
-             "CPU at idle entry: %.1f%%",
+             "CPU at activation: %.1f%%",
              BHFCPUPercent
         );
     }
@@ -515,10 +593,6 @@ static void BHFCollectStats(void)
         BHFApplyGovernor();
     }
 
-
-    /*
-     * Memory.
-     */
 
     NSUInteger memory =
         BHFMemoryMB();
@@ -551,20 +625,20 @@ static void BHFCollectStats(void)
     NSString *output =
         [NSString stringWithFormat:
             @"BumbleHeatFix\n"
-             "EXPERIMENT v2.1\n\n"
+             "EXPERIMENT v2.2\n\n"
              "CPU: %.1f%%\n"
              "Peak CPU: %.1f%%\n"
              "Memory: %lu MB\n\n"
              "Mode: %@\n"
-             "Threads changed: %lu\n"
+             "Tracked: %lu\n"
              "Successful: %lu\n"
              "Failed: %lu\n\n"
-             "CPU trigger: %.0f%%",
+             "Trigger: %.0f%%",
              BHFCPUPercent,
              BHFPeakCPUPercent,
              (unsigned long)memory,
              mode,
-             (unsigned long)BHFTrackedThreads,
+             (unsigned long)BHFTrackedCount,
              (unsigned long)BHFSuccessfulChanges,
              (unsigned long)BHFFailedChanges,
              BHF_CPU_TRIGGER
@@ -582,7 +656,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Experimental v2.1 loaded"
+             "Experimental v2.2 loaded"
         );
 
         dispatch_after(
