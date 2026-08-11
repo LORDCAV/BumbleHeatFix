@@ -17,14 +17,10 @@ static CFTimeInterval BHFPreviousTime = 0.0;
 static double BHFCPUPercent = 0.0;
 static double BHFPeakCPU = 0.0;
 
-static BOOL BHFGovernorEnabled = YES;
-static thread_t BHFGovernorThread = MACH_PORT_NULL;
-static CFTimeInterval BHFGovernorStartTime = 0.0;
 static NSUInteger BHFHotSamples = 0;
 
 #define BHF_HOT_THRESHOLD 85.0
 #define BHF_REQUIRED_HOT_SAMPLES 3
-#define BHF_GOVERNOR_DURATION 5.0
 
 
 #pragma mark - Window
@@ -287,152 +283,6 @@ static NSUInteger BHFCollectThreads(
 }
 
 
-#pragma mark - Soft Governor
-
-static BOOL BHFLowerThreadPriority(
-    thread_t thread
-)
-{
-    if (thread == MACH_PORT_NULL) {
-        return NO;
-    }
-
-    /*
-     * THREAD_PRECEDENCE_POLICY changes scheduling
-     * importance without suspending the thread.
-     */
-
-    thread_precedence_policy_data_t policy;
-
-    policy.importance = -10;
-
-    mach_msg_type_number_t count =
-        THREAD_PRECEDENCE_POLICY_COUNT;
-
-    kern_return_t kr =
-        thread_policy_set(
-            thread,
-            THREAD_PRECEDENCE_POLICY,
-            (thread_policy_t)&policy,
-            count
-        );
-
-    if (kr != KERN_SUCCESS) {
-        return NO;
-    }
-
-    return YES;
-}
-
-
-static BOOL BHFRestoreThreadPriority(
-    thread_t thread
-)
-{
-    if (thread == MACH_PORT_NULL) {
-        return NO;
-    }
-
-    thread_precedence_policy_data_t policy;
-
-    policy.importance = 0;
-
-    mach_msg_type_number_t count =
-        THREAD_PRECEDENCE_POLICY_COUNT;
-
-    kern_return_t kr =
-        thread_policy_set(
-            thread,
-            THREAD_PRECEDENCE_POLICY,
-            (thread_policy_t)&policy,
-            count
-        );
-
-    if (kr != KERN_SUCCESS) {
-        return NO;
-    }
-
-    return YES;
-}
-
-
-static void BHFGovernorTick(
-    BHFThreadSample hot
-)
-{
-    if (!BHFGovernorEnabled) {
-        return;
-    }
-
-
-    CFTimeInterval now =
-        CACurrentMediaTime();
-
-
-    /*
-     * Restore the previously governed thread.
-     */
-
-    if (BHFGovernorThread != MACH_PORT_NULL) {
-
-        if ((now - BHFGovernorStartTime) >=
-            BHF_GOVERNOR_DURATION) {
-
-            BHFRestoreThreadPriority(
-                BHFGovernorThread
-            );
-
-            BHFGovernorThread =
-                MACH_PORT_NULL;
-
-            BHFGovernorStartTime =
-                0.0;
-        }
-    }
-
-
-    /*
-     * Only consider a thread that is
-     * actually consuming substantial CPU.
-     */
-
-    if (hot.cpu >= BHF_HOT_THRESHOLD) {
-
-        BHFHotSamples++;
-
-    } else {
-
-        BHFHotSamples = 0;
-    }
-
-
-    /*
-     * Require several consecutive samples
-     * before changing scheduling priority.
-     */
-
-    if (BHFHotSamples >=
-        BHF_REQUIRED_HOT_SAMPLES) {
-
-        if (BHFGovernorThread ==
-            MACH_PORT_NULL) {
-
-            if (BHFLowerThreadPriority(
-                    hot.thread)) {
-
-                BHFGovernorThread =
-                    hot.thread;
-
-                BHFGovernorStartTime =
-                    now;
-            }
-
-            BHFHotSamples = 0;
-        }
-    }
-}
-
-
 #pragma mark - Overlay
 
 static void BHFCreateOverlay(void)
@@ -459,7 +309,7 @@ static void BHFCreateOverlay(void)
                         6,
                         45,
                         405,
-                        500
+                        520
                     )];
 
         BHFLabel.numberOfLines = 0;
@@ -479,19 +329,15 @@ static void BHFCreateOverlay(void)
             [[UIColor blackColor]
                 colorWithAlphaComponent:0.90];
 
-        BHFLabel.layer.cornerRadius =
-            8.0;
-
-        BHFLabel.layer.masksToBounds =
-            YES;
+        BHFLabel.layer.cornerRadius = 8.0;
+        BHFLabel.layer.masksToBounds = YES;
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "SOFT GOVERNOR v2.9\n\n"
+             "TARGET MONITOR v2.9.1\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
-             "Governor: ON\n"
-             "Hot samples: 0";
+             "Governor: OBSERVATION ONLY";
 
         [window addSubview:BHFLabel];
     });
@@ -577,11 +423,15 @@ static void BHFCollectStats(void)
         BHFMemoryMB();
 
 
-    if (count > 0) {
+    if (count > 0 &&
+        samples[0].cpu >=
+            BHF_HOT_THRESHOLD) {
 
-        BHFGovernorTick(
-            samples[0]
-        );
+        BHFHotSamples++;
+
+    } else {
+
+        BHFHotSamples = 0;
     }
 
 
@@ -591,19 +441,16 @@ static void BHFCollectStats(void)
 
     [output appendFormat:
         @"BumbleHeatFix\n"
-         "SOFT GOVERNOR v2.9\n\n"
+         "TARGET MONITOR v2.9.1\n\n"
          "CPU: %.1f%%\n"
          "Peak: %.1f%%\n"
          "Memory: %lu MB\n"
-         "Governor: %@\n"
+         "Governor: OBSERVATION ONLY\n"
          "Hot samples: %lu\n\n",
 
         BHFCPUPercent,
         BHFPeakCPU,
-        (BHFGovernorEnabled
-            ? @"ON"
-            : @"OFF"),
-
+        (unsigned long)memory,
         (unsigned long)BHFHotSamples
     ];
 
@@ -623,9 +470,12 @@ static void BHFCollectStats(void)
         samples[0];
 
 
+    [output appendString:
+        @"HOT THREAD\n"];
+
+
     [output appendFormat:
-        @"HOT THREAD\n"
-         "T%u %.1f%% %@\n",
+        @"T%u %.1f%% %@\n",
 
         hot.thread,
         hot.cpu,
@@ -636,27 +486,16 @@ static void BHFCollectStats(void)
     ];
 
 
-    if (BHFGovernorThread !=
-        MACH_PORT_NULL) {
-
-        [output appendFormat:
-            @"\nGOVERNED THREAD\n"
-             "T%u\n"
-             "Priority: LOWERED\n",
-
-            BHFGovernorThread
-        ];
-
-    } else {
-
-        [output appendString:
-            @"\nGOVERNED THREAD\n"
-             "None\n"];
-    }
+    [output appendString:
+        @"\nTARGET STATUS\n"
+         "No thread priority changes\n"
+         "No thread suspension\n"
+         "No thread termination\n"
+         "Monitoring only\n\n"];
 
 
     [output appendString:
-        @"\nOTHER HOT THREADS\n"];
+        @"OTHER HOT THREADS\n"];
 
 
     for (NSUInteger i = 1;
@@ -693,7 +532,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Soft Governor v2.9 loaded"
+             "Target Monitor v2.9.1 loaded"
         );
 
 
