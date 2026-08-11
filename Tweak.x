@@ -1,8 +1,13 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+
 #import <mach/mach.h>
 #import <mach/thread_info.h>
+#import <mach/thread_act.h>
+#import <mach/arm/thread_status.h>
+
+#import <dlfcn.h>
 
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFMonitorTimer = nil;
@@ -60,7 +65,7 @@ static UIWindow *BHFGetWindow(void)
 }
 
 
-#pragma mark - CPU
+#pragma mark - CPU Time
 
 static double BHFProcessCPUTime(void)
 {
@@ -142,21 +147,127 @@ typedef struct {
 
     integer_t suspendCount;
 
-    integer_t sleepTime;
+    uint64_t programCounter;
 
 } BHFThreadSample;
 
 
-#pragma mark - Collect Threads
+#pragma mark - Program Counter
+
+static BOOL BHFGetThreadPC(
+    thread_t thread,
+    uint64_t *pcOut
+)
+{
+    if (pcOut == NULL) {
+        return NO;
+    }
+
+    arm_thread_state64_t state;
+
+    mach_msg_type_number_t count =
+        ARM_THREAD_STATE64_COUNT;
+
+    kern_return_t kr =
+        thread_get_state(
+            thread,
+            ARM_THREAD_STATE64,
+            (thread_state_t)&state,
+            &count
+        );
+
+    if (kr != KERN_SUCCESS) {
+        return NO;
+    }
+
+    *pcOut =
+        arm_thread_state64_get_pc(state);
+
+    return YES;
+}
+
+
+#pragma mark - Image Information
+
+static NSString *BHFImageForAddress(
+    uint64_t address,
+    NSString **symbolOut,
+    intptr_t *slideOut
+)
+{
+    if (symbolOut != NULL) {
+        *symbolOut = @"unknown";
+    }
+
+    if (slideOut != NULL) {
+        *slideOut = 0;
+    }
+
+    Dl_info info;
+
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
+
+    if (dladdr(
+            (const void *)(uintptr_t)address,
+            &info
+        ) == 0) {
+
+        return @"unknown";
+    }
+
+
+    NSString *image =
+        info.dli_fname
+        ? [NSString
+            stringWithUTF8String:
+                info.dli_fname]
+        : @"unknown";
+
+
+    if (symbolOut != NULL &&
+        info.dli_sname != NULL) {
+
+        *symbolOut =
+            [NSString
+                stringWithUTF8String:
+                    info.dli_sname];
+    }
+
+
+    if (slideOut != NULL) {
+
+        if (info.dli_fbase != NULL) {
+
+            *slideOut =
+                (intptr_t)
+                address -
+                (intptr_t)
+                info.dli_saddr;
+        }
+    }
+
+
+    return image;
+}
+
+
+#pragma mark - Thread Collection
 
 static NSUInteger BHFCollectThreads(
     BHFThreadSample *samples,
     NSUInteger maximum
 )
 {
-    thread_act_array_t threadList = NULL;
+    thread_act_array_t threadList =
+        NULL;
 
-    mach_msg_type_number_t threadCount = 0;
+    mach_msg_type_number_t threadCount =
+        0;
+
 
     kern_return_t kr =
         task_threads(
@@ -164,6 +275,7 @@ static NSUInteger BHFCollectThreads(
             &threadList,
             &threadCount
         );
+
 
     if (kr != KERN_SUCCESS ||
         threadList == NULL) {
@@ -174,7 +286,8 @@ static NSUInteger BHFCollectThreads(
 
     BHFThreadSample temp[128];
 
-    NSUInteger tempCount = 0;
+    NSUInteger tempCount =
+        0;
 
 
     for (NSUInteger i = 0;
@@ -209,8 +322,7 @@ static NSUInteger BHFCollectThreads(
 
 
         /*
-         * Ignore threads doing
-         * practically no CPU work.
+         * Ignore practically idle threads.
          */
 
         if (cpu < 0.1) {
@@ -233,15 +345,30 @@ static NSUInteger BHFCollectThreads(
         temp[tempCount].suspendCount =
             info.suspend_count;
 
-        temp[tempCount].sleepTime =
-            info.sleep_time;
+
+        uint64_t pc = 0;
+
+        if (BHFGetThreadPC(
+                threadList[i],
+                &pc
+            )) {
+
+            temp[tempCount].programCounter =
+                pc;
+
+        } else {
+
+            temp[tempCount].programCounter =
+                0;
+        }
+
 
         tempCount++;
     }
 
 
     /*
-     * Sort threads by CPU usage.
+     * Sort by CPU usage.
      */
 
     for (NSUInteger i = 0;
@@ -287,7 +414,8 @@ static NSUInteger BHFCollectThreads(
     vm_deallocate(
         mach_task_self(),
         (vm_address_t)threadList,
-        threadCount * sizeof(thread_t)
+        threadCount *
+        sizeof(thread_t)
     );
 
 
@@ -352,8 +480,8 @@ static void BHFCreateOverlay(void)
                     CGRectMake(
                         8,
                         50,
-                        375,
-                        350
+                        380,
+                        430
                     )];
 
 
@@ -367,7 +495,7 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.font =
             [UIFont
-                monospacedSystemFontOfSize:10.5
+                monospacedSystemFontOfSize:10.0
                 weight:UIFontWeightMedium];
 
 
@@ -377,7 +505,7 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.backgroundColor =
             [[UIColor blackColor]
-                colorWithAlphaComponent:0.86];
+                colorWithAlphaComponent:0.88];
 
 
         BHFLabel.layer.cornerRadius =
@@ -390,12 +518,12 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "PROFILER v2.3.1\n\n"
+             "STACK TARGET v2.4\n\n"
              "CPU: measuring...\n"
-             "Peak CPU: measuring...\n"
+             "Peak: measuring...\n"
              "State: starting...\n\n"
-             "Top CPU threads:\n"
-             "Collecting...";
+             "Top CPU thread:\n"
+             "Collecting PC...";
 
 
         [window addSubview:BHFLabel];
@@ -417,13 +545,14 @@ static void BHFUpdateOverlay(
 
 
         if (BHFLabel != nil) {
-            BHFLabel.text = text;
+            BHFLabel.text =
+                text;
         }
     });
 }
 
 
-#pragma mark - Statistics
+#pragma mark - Monitor
 
 static void BHFCollectStats(void)
 {
@@ -436,12 +565,13 @@ static void BHFCollectStats(void)
 
 
     /*
-     * Calculate CPU percentage.
+     * Process CPU percentage.
      */
 
     if (BHFPreviousTime > 0.0 &&
         now > BHFPreviousTime &&
-        currentCPU >= BHFPreviousCPUTime) {
+        currentCPU >=
+            BHFPreviousCPUTime) {
 
         double elapsed =
             now -
@@ -479,14 +609,11 @@ static void BHFCollectStats(void)
 
 
     /*
-     * Idle state.
-     *
-     * This profiler intentionally
-     * does NOT modify threads.
+     * Idle timer.
      */
 
-    static CFTimeInterval idleStart =
-        0.0;
+    static CFTimeInterval
+        idleStart = 0.0;
 
 
     if (idleStart == 0.0) {
@@ -509,7 +636,7 @@ static void BHFCollectStats(void)
 
 
     /*
-     * Collect top CPU threads.
+     * Collect threads.
      */
 
     BHFThreadSample samples[
@@ -521,6 +648,10 @@ static void BHFCollectStats(void)
             samples,
             BHF_MAX_TOP_THREADS
         );
+
+
+    NSUInteger memory =
+        BHFMemoryMB();
 
 
     NSMutableString *threadText =
@@ -535,9 +666,37 @@ static void BHFCollectStats(void)
             samples[i];
 
 
+        NSString *symbol =
+            @"unknown";
+
+
+        intptr_t slide =
+            0;
+
+
+        NSString *image =
+            BHFImageForAddress(
+                sample.programCounter,
+                &symbol,
+                &slide
+            );
+
+
+        /*
+         * Shorten common framework
+         * paths to make the overlay
+         * readable.
+         */
+
+        NSString *imageName =
+            [image lastPathComponent];
+
+
         [threadText appendFormat:
-            @"%lu. %u  %.1f%% %@ "
-             "S%d F0x%x\n",
+            @"%lu. T%u %.1f%% %@\n"
+             "   PC: 0x%llx\n"
+             "   Image: %@\n"
+             "   Symbol: %@\n",
 
             (unsigned long)(i + 1),
 
@@ -549,9 +708,11 @@ static void BHFCollectStats(void)
                 sample.runState
             ),
 
-            sample.suspendCount,
+            sample.programCounter,
 
-            sample.flags
+            imageName,
+
+            symbol
         ];
     }
 
@@ -564,13 +725,9 @@ static void BHFCollectStats(void)
     }
 
 
-    NSUInteger memory =
-        BHFMemoryMB();
-
-
     NSString *state =
         BHFIdle
-        ? @"IDLE - PROFILING"
+        ? @"IDLE - TARGETING"
         : @"ACTIVE";
 
 
@@ -578,14 +735,14 @@ static void BHFCollectStats(void)
         [NSString stringWithFormat:
 
             @"BumbleHeatFix\n"
-             "PROFILER v2.3.1\n\n"
+             "STACK TARGET v2.4\n\n"
 
              "CPU: %.1f%%\n"
-             "Peak CPU: %.1f%%\n"
+             "Peak: %.1f%%\n"
              "Memory: %lu MB\n"
              "State: %@\n\n"
 
-             "Top CPU threads:\n"
+             "TOP THREADS\n"
              "%@",
 
             BHFCPUPercent,
@@ -606,25 +763,6 @@ static void BHFCollectStats(void)
 }
 
 
-#pragma mark - UIApplication Hook
-
-%hook UIApplication
-
-- (void)sendEvent:(UIEvent *)event
-{
-    /*
-     * This hook is observation-only.
-     *
-     * We do not alter Bumble's
-     * behavior here.
-     */
-
-    %orig;
-}
-
-%end
-
-
 #pragma mark - Constructor
 
 %ctor
@@ -633,7 +771,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Profiler v2.3.1 loaded"
+             "Stack target profiler v2.4 loaded"
         );
 
 
