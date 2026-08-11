@@ -199,6 +199,7 @@ static NSUInteger BHFCollectThreads(
 
     NSUInteger tempCount = 0;
 
+
     for (NSUInteger i = 0;
          i < threadCount &&
          tempCount < BHF_MAX_THREADS;
@@ -289,8 +290,10 @@ static NSUInteger BHFCollectThreads(
     vm_deallocate(
         mach_task_self(),
         (vm_address_t)threadList,
-        threadCount *
-        sizeof(thread_t)
+        (vm_size_t)(
+            threadCount *
+            sizeof(thread_t)
+        )
     );
 
 
@@ -408,6 +411,7 @@ BHFGetThreadRegisters(thread_t thread)
     result.fp = 0;
     result.valid = NO;
 
+
 #if defined(__arm64__)
 
     arm_thread_state64_t state;
@@ -440,11 +444,12 @@ BHFGetThreadRegisters(thread_t thread)
 
 #endif
 
+
     return result;
 }
 
 
-#pragma mark - Safe Stack Read
+#pragma mark - Safe Pointer Read
 
 static BOOL BHFReadPointer(
     uintptr_t address,
@@ -457,45 +462,42 @@ static BOOL BHFReadPointer(
         return NO;
     }
 
-    vm_offset_t data = 0;
 
-    mach_msg_type_number_t dataCount =
-        (mach_msg_type_number_t)
-            sizeof(uintptr_t);
+    vm_size_t outputSize =
+        (vm_size_t)sizeof(uintptr_t);
+
 
     kern_return_t kr =
         vm_read_overwrite(
             mach_task_self(),
+
             (vm_address_t)address,
+
             (vm_size_t)sizeof(uintptr_t),
+
             (vm_address_t)value,
-            &dataCount
+
+            &outputSize
         );
 
-    /*
-     * Some SDKs define vm_read_overwrite using
-     * a different destination type. The unused
-     * data variable is intentionally retained
-     * for compatibility with the Mach API.
-     */
-
-    (void)data;
 
     if (kr != KERN_SUCCESS) {
         return NO;
     }
 
-    if (dataCount !=
-        sizeof(uintptr_t)) {
+
+    if (outputSize !=
+        (vm_size_t)sizeof(uintptr_t)) {
 
         return NO;
     }
+
 
     return YES;
 }
 
 
-#pragma mark - Frame Pointer Walk
+#pragma mark - Stack Walker
 
 static NSArray<NSString *> *
 BHFResolveThreadStack(
@@ -506,6 +508,7 @@ BHFResolveThreadStack(
         BHFGetThreadRegisters(
             thread
         );
+
 
     if (!regs.valid) {
 
@@ -675,6 +678,7 @@ BHFResolveThreadStack(
 
 #endif
 
+
     return frames;
 }
 
@@ -769,6 +773,7 @@ static void BHFUpdateOverlay(
             BHFCreateOverlay();
         }
 
+
         if (BHFLabel != nil) {
             BHFLabel.text =
                 text;
@@ -777,7 +782,7 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Stats
+#pragma mark - Statistics
 
 static void BHFCollectStats(void)
 {
@@ -856,6 +861,7 @@ static void BHFCollectStats(void)
                      "No active CPU threads.",
 
                     BHFCPUPercent,
+
                     BHFPeakCPU,
 
                     (unsigned long)memory
@@ -896,6 +902,7 @@ static void BHFCollectStats(void)
          "Hot samples: %lu\n\n",
 
         BHFCPUPercent,
+
         BHFPeakCPU,
 
         (unsigned long)memory,
@@ -909,6 +916,7 @@ static void BHFCollectStats(void)
          "T%u %.1f%% %@\n\n",
 
         hot.thread,
+
         hot.cpu,
 
         BHFRunStateName(
