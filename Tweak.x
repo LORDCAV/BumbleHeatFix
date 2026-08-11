@@ -8,6 +8,8 @@
 #import <mach/arm/thread_status.h>
 
 #import <dlfcn.h>
+#import <stdint.h>
+#import <string.h>
 
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFMonitorTimer = nil;
@@ -22,6 +24,7 @@ static BOOL BHFIdle = NO;
 
 #define BHF_IDLE_DELAY 15.0
 #define BHF_MAX_TOP_THREADS 5
+#define BHF_MAX_STACK_FRAMES 8
 
 
 #pragma mark - Window
@@ -65,7 +68,7 @@ static UIWindow *BHFGetWindow(void)
 }
 
 
-#pragma mark - CPU Time
+#pragma mark - Process CPU
 
 static double BHFProcessCPUTime(void)
 {
@@ -133,7 +136,7 @@ static NSUInteger BHFMemoryMB(void)
 }
 
 
-#pragma mark - Thread Sample
+#pragma mark - Thread Information
 
 typedef struct {
 
@@ -147,22 +150,21 @@ typedef struct {
 
     integer_t suspendCount;
 
-    uint64_t programCounter;
+    uint64_t pc;
+
+    uint64_t fp;
 
 } BHFThreadSample;
 
 
-#pragma mark - Program Counter
+#pragma mark - Thread State
 
-static BOOL BHFGetThreadPC(
+static BOOL BHFGetThreadState(
     thread_t thread,
-    uint64_t *pcOut
+    uint64_t *pcOut,
+    uint64_t *fpOut
 )
 {
-    if (pcOut == NULL) {
-        return NO;
-    }
-
     arm_thread_state64_t state;
 
     mach_msg_type_number_t count =
@@ -180,27 +182,31 @@ static BOOL BHFGetThreadPC(
         return NO;
     }
 
-    *pcOut =
-        arm_thread_state64_get_pc(state);
+    if (pcOut != NULL) {
+
+        *pcOut =
+            arm_thread_state64_get_pc(state);
+    }
+
+    if (fpOut != NULL) {
+
+        *fpOut =
+            arm_thread_state64_get_fp(state);
+    }
 
     return YES;
 }
 
 
-#pragma mark - Image Information
+#pragma mark - Symbolication
 
 static NSString *BHFImageForAddress(
     uint64_t address,
-    NSString **symbolOut,
-    intptr_t *slideOut
+    NSString **symbolOut
 )
 {
     if (symbolOut != NULL) {
         *symbolOut = @"unknown";
-    }
-
-    if (slideOut != NULL) {
-        *slideOut = 0;
     }
 
     Dl_info info;
@@ -211,6 +217,10 @@ static NSString *BHFImageForAddress(
         sizeof(info)
     );
 
+    if (address == 0) {
+        return @"unknown";
+    }
+
     if (dladdr(
             (const void *)(uintptr_t)address,
             &info
@@ -219,14 +229,12 @@ static NSString *BHFImageForAddress(
         return @"unknown";
     }
 
-
     NSString *image =
         info.dli_fname
         ? [NSString
             stringWithUTF8String:
                 info.dli_fname]
         : @"unknown";
-
 
     if (symbolOut != NULL &&
         info.dli_sname != NULL) {
@@ -237,21 +245,156 @@ static NSString *BHFImageForAddress(
                     info.dli_sname];
     }
 
+    return image;
+}
 
-    if (slideOut != NULL) {
 
-        if (info.dli_fbase != NULL) {
+#pragma mark - Stack Frame Reader
 
-            *slideOut =
-                (intptr_t)
-                address -
-                (intptr_t)
-                info.dli_saddr;
-        }
+static BOOL BHFReadStackFrame(
+    uint64_t framePointer,
+    uint64_t *nextFrame,
+    uint64_t *returnAddress
+)
+{
+    if (framePointer == 0 ||
+        nextFrame == NULL ||
+        returnAddress == NULL) {
+
+        return NO;
     }
 
 
-    return image;
+    /*
+     * ARM64 frame record:
+     *
+     * [FP + 0]  = previous FP
+     * [FP + 8]  = saved LR
+     *
+     * We only read memory belonging
+     * to this process.
+     */
+
+
+    uint64_t *frame =
+        (uint64_t *)(uintptr_t)framePointer;
+
+
+    /*
+     * Basic sanity check.
+     *
+     * Keep the frame chain from
+     * wandering indefinitely.
+     */
+
+    if (framePointer & 0x7) {
+        return NO;
+    }
+
+
+    uint64_t previousFP =
+        frame[0];
+
+    uint64_t savedLR =
+        frame[1];
+
+
+    if (previousFP == 0 ||
+        savedLR == 0) {
+
+        return NO;
+    }
+
+
+    /*
+     * Prevent obviously invalid
+     * or backwards frame chains.
+     */
+
+    if (previousFP <= framePointer) {
+        return NO;
+    }
+
+
+    if (previousFP -
+        framePointer >
+        (1024ULL * 1024ULL)) {
+
+        return NO;
+    }
+
+
+    *nextFrame =
+        previousFP;
+
+    *returnAddress =
+        savedLR;
+
+
+    return YES;
+}
+
+
+#pragma mark - Stack Collection
+
+static NSUInteger BHFCollectStack(
+    BHFThreadSample sample,
+    uint64_t *addresses,
+    NSUInteger maximum
+)
+{
+    if (addresses == NULL ||
+        maximum == 0) {
+
+        return 0;
+    }
+
+
+    NSUInteger count = 0;
+
+
+    /*
+     * First frame is the current PC.
+     */
+
+    if (sample.pc != 0) {
+
+        addresses[count++] =
+            sample.pc;
+    }
+
+
+    uint64_t fp =
+        sample.fp;
+
+
+    while (count < maximum) {
+
+        uint64_t nextFP = 0;
+
+        uint64_t returnAddress = 0;
+
+
+        if (!BHFReadStackFrame(
+                fp,
+                &nextFP,
+                &returnAddress
+            )) {
+
+            break;
+        }
+
+
+        addresses[count++] =
+            returnAddress;
+
+
+        fp =
+            nextFP;
+    }
+
+
+    return count;
 }
 
 
@@ -321,54 +464,50 @@ static NSUInteger BHFCollectThreads(
             100.0;
 
 
-        /*
-         * Ignore practically idle threads.
-         */
-
         if (cpu < 0.1) {
             continue;
         }
 
 
-        temp[tempCount].thread =
+        BHFThreadSample sample;
+
+        memset(
+            &sample,
+            0,
+            sizeof(sample)
+        );
+
+
+        sample.thread =
             threadList[i];
 
-        temp[tempCount].cpu =
+        sample.cpu =
             cpu;
 
-        temp[tempCount].runState =
+        sample.runState =
             info.run_state;
 
-        temp[tempCount].flags =
+        sample.flags =
             info.flags;
 
-        temp[tempCount].suspendCount =
+        sample.suspendCount =
             info.suspend_count;
 
 
-        uint64_t pc = 0;
-
-        if (BHFGetThreadPC(
-                threadList[i],
-                &pc
-            )) {
-
-            temp[tempCount].programCounter =
-                pc;
-
-        } else {
-
-            temp[tempCount].programCounter =
-                0;
-        }
+        BHFGetThreadState(
+            threadList[i],
+            &sample.pc,
+            &sample.fp
+        );
 
 
-        tempCount++;
+        temp[tempCount++] =
+            sample;
     }
 
 
     /*
-     * Sort by CPU usage.
+     * Sort hottest first.
      */
 
     for (NSUInteger i = 0;
@@ -478,10 +617,10 @@ static void BHFCreateOverlay(void)
             [[UILabel alloc]
                 initWithFrame:
                     CGRectMake(
-                        8,
-                        50,
-                        380,
-                        430
+                        6,
+                        45,
+                        390,
+                        600
                     )];
 
 
@@ -495,7 +634,7 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.font =
             [UIFont
-                monospacedSystemFontOfSize:10.0
+                monospacedSystemFontOfSize:9.0
                 weight:UIFontWeightMedium];
 
 
@@ -505,7 +644,7 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.backgroundColor =
             [[UIColor blackColor]
-                colorWithAlphaComponent:0.88];
+                colorWithAlphaComponent:0.90];
 
 
         BHFLabel.layer.cornerRadius =
@@ -518,12 +657,12 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "STACK TARGET v2.4\n\n"
+             "STACK SAMPLER v2.5\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
              "State: starting...\n\n"
-             "Top CPU thread:\n"
-             "Collecting PC...";
+             "Hot thread:\n"
+             "Collecting stack...";
 
 
         [window addSubview:BHFLabel];
@@ -552,7 +691,7 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Monitor
+#pragma mark - Statistics
 
 static void BHFCollectStats(void)
 {
@@ -563,10 +702,6 @@ static void BHFCollectStats(void)
     double currentCPU =
         BHFProcessCPUTime();
 
-
-    /*
-     * Process CPU percentage.
-     */
 
     if (BHFPreviousTime > 0.0 &&
         now > BHFPreviousTime &&
@@ -608,10 +743,6 @@ static void BHFCollectStats(void)
     }
 
 
-    /*
-     * Idle timer.
-     */
-
     static CFTimeInterval
         idleStart = 0.0;
 
@@ -623,21 +754,12 @@ static void BHFCollectStats(void)
     }
 
 
-    double idleTime =
-        now -
-        idleStart;
-
-
-    if (idleTime >=
+    if ((now - idleStart) >=
         BHF_IDLE_DELAY) {
 
         BHFIdle = YES;
     }
 
-
-    /*
-     * Collect threads.
-     */
 
     BHFThreadSample samples[
         BHF_MAX_TOP_THREADS];
@@ -654,107 +776,195 @@ static void BHFCollectStats(void)
         BHFMemoryMB();
 
 
-    NSMutableString *threadText =
+    NSMutableString *output =
         [NSMutableString string];
 
 
-    for (NSUInteger i = 0;
-         i < count;
-         i++) {
+    [output appendFormat:
+        @"BumbleHeatFix\n"
+         "STACK SAMPLER v2.5\n\n"
+         "CPU: %.1f%%\n"
+         "Peak: %.1f%%\n"
+         "Memory: %lu MB\n"
+         "State: %@\n\n",
 
-        BHFThreadSample sample =
-            samples[i];
+        BHFCPUPercent,
 
+        BHFPeakCPU,
 
-        NSString *symbol =
-            @"unknown";
+        (unsigned long)memory,
 
-
-        intptr_t slide =
-            0;
-
-
-        NSString *image =
-            BHFImageForAddress(
-                sample.programCounter,
-                &symbol,
-                &slide
-            );
-
-
-        /*
-         * Shorten common framework
-         * paths to make the overlay
-         * readable.
-         */
-
-        NSString *imageName =
-            [image lastPathComponent];
-
-
-        [threadText appendFormat:
-            @"%lu. T%u %.1f%% %@\n"
-             "   PC: 0x%llx\n"
-             "   Image: %@\n"
-             "   Symbol: %@\n",
-
-            (unsigned long)(i + 1),
-
-            sample.thread,
-
-            sample.cpu,
-
-            BHFRunStateName(
-                sample.runState
-            ),
-
-            sample.programCounter,
-
-            imageName,
-
-            symbol
-        ];
-    }
+        BHFIdle
+            ? @"IDLE - SAMPLING"
+            : @"ACTIVE"
+    ];
 
 
     if (count == 0) {
 
-        [threadText
-            appendString:
-                @"No active threads\n"];
+        [output appendString:
+            @"No active threads.\n"];
+
+        BHFUpdateOverlay(
+            output
+        );
+
+        return;
     }
 
 
-    NSString *state =
-        BHFIdle
-        ? @"IDLE - TARGETING"
-        : @"ACTIVE";
+    /*
+     * Focus primarily on the
+     * hottest thread.
+     */
+
+    BHFThreadSample hot =
+        samples[0];
 
 
-    NSString *output =
-        [NSString stringWithFormat:
+    [output appendFormat:
+        @"HOT THREAD\n"
+         "T%u  %.1f%% %@\n"
+         "PC: 0x%llx\n"
+         "FP: 0x%llx\n\n",
 
-            @"BumbleHeatFix\n"
-             "STACK TARGET v2.4\n\n"
+        hot.thread,
 
-             "CPU: %.1f%%\n"
-             "Peak: %.1f%%\n"
-             "Memory: %lu MB\n"
-             "State: %@\n\n"
+        hot.cpu,
 
-             "TOP THREADS\n"
-             "%@",
+        BHFRunStateName(
+            hot.runState
+        ),
 
-            BHFCPUPercent,
+        hot.pc,
 
-            BHFPeakCPU,
+        hot.fp
+    ];
 
-            (unsigned long)memory,
 
-            state,
+    /*
+     * Current PC + frame chain.
+     */
 
-            threadText
-        ];
+    uint64_t stack[
+        BHF_MAX_STACK_FRAMES];
+
+
+    memset(
+        stack,
+        0,
+        sizeof(stack)
+    );
+
+
+    NSUInteger stackCount =
+        BHFCollectStack(
+            hot,
+            stack,
+            BHF_MAX_STACK_FRAMES
+        );
+
+
+    [output appendString:
+        @"STACK:\n"];
+
+
+    if (stackCount == 0) {
+
+        [output appendString:
+            @"Unable to read frame chain.\n"];
+
+    } else {
+
+        for (NSUInteger i = 0;
+             i < stackCount;
+             i++) {
+
+            NSString *symbol =
+                @"unknown";
+
+
+            NSString *image =
+                BHFImageForAddress(
+                    stack[i],
+                    &symbol
+                );
+
+
+            NSString *imageName =
+                [image lastPathComponent];
+
+
+            [output appendFormat:
+                @"#%lu 0x%llx\n"
+                 "    %@\n"
+                 "    %@\n",
+
+                (unsigned long)i,
+
+                stack[i],
+
+                imageName,
+
+                symbol
+            ];
+        }
+    }
+
+
+    /*
+     * Other top CPU threads.
+     */
+
+    if (count > 1) {
+
+        [output appendString:
+            @"\nOTHER HOT THREADS:\n"];
+
+
+        for (NSUInteger i = 1;
+             i < count;
+             i++) {
+
+            BHFThreadSample sample =
+                samples[i];
+
+
+            NSString *symbol =
+                @"unknown";
+
+
+            NSString *image =
+                BHFImageForAddress(
+                    sample.pc,
+                    &symbol
+                );
+
+
+            NSString *imageName =
+                [image lastPathComponent];
+
+
+            [output appendFormat:
+                @"%lu. T%u %.1f%% %@\n"
+                 "    %@ :: %@\n",
+
+                (unsigned long)(i + 1),
+
+                sample.thread,
+
+                sample.cpu,
+
+                BHFRunStateName(
+                    sample.runState
+                ),
+
+                imageName,
+
+                symbol
+            ];
+        }
+    }
 
 
     BHFUpdateOverlay(
@@ -771,7 +981,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Stack target profiler v2.4 loaded"
+             "Stack sampler v2.5 loaded"
         );
 
 
