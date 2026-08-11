@@ -3,13 +3,12 @@
 #import <QuartzCore/QuartzCore.h>
 
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/thread_info.h>
 #import <mach/thread_act.h>
+#import <mach/arm/thread_status.h>
 
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <mach-o/getsect.h>
 
 #include <stdint.h>
 #include <string.h>
@@ -64,6 +63,35 @@ static UIWindow *BHFGetWindow(void)
     }
 
     return result;
+}
+
+
+#pragma mark - Run State
+
+static NSString *BHFRunStateName(
+    integer_t state
+)
+{
+    switch (state) {
+
+        case TH_STATE_RUNNING:
+            return @"RUNNING";
+
+        case TH_STATE_WAITING:
+            return @"WAITING";
+
+        case TH_STATE_STOPPED:
+            return @"STOPPED";
+
+        case TH_STATE_UNINTERRUPTIBLE:
+            return @"UNINTERRUPTIBLE";
+
+        case TH_STATE_HALTED:
+            return @"HALTED";
+
+        default:
+            return @"UNKNOWN";
+    }
 }
 
 
@@ -336,7 +364,7 @@ static NSUInteger BHFCollectThreads(
 }
 
 
-#pragma mark - Image Lookup
+#pragma mark - Image Information
 
 typedef struct {
 
@@ -386,22 +414,9 @@ static BHFImageInfo BHFFindImage(
             _dyld_get_image_vmaddr_slide(i);
 
 
-        uint64_t base =
-            (uint64_t)(
-                (uintptr_t)header
-            );
-
-
-        uint64_t maxAddress =
-            base;
-
-
         const uint8_t *cursor =
             (const uint8_t *)header +
             sizeof(struct mach_header_64);
-
-
-        const struct load_command *command;
 
 
         for (uint32_t commandIndex = 0;
@@ -409,7 +424,7 @@ static BHFImageInfo BHFFindImage(
                  header->ncmds;
              commandIndex++) {
 
-            command =
+            const struct load_command *command =
                 (const struct load_command *)
                     cursor;
 
@@ -424,32 +439,16 @@ static BHFImageInfo BHFFindImage(
                         command;
 
 
-                uint64_t segmentStart =
-                    (uint64_t)
-                        segment->vmaddr;
-
-
-                uint64_t segmentEnd =
-                    segmentStart +
-                    segment->vmsize;
-
-
                 uint64_t runtimeStart =
-                    segmentStart +
-                    slide;
+                    ((uint64_t)
+                        segment->vmaddr) +
+                    (uint64_t)slide;
 
 
                 uint64_t runtimeEnd =
-                    segmentEnd +
-                    slide;
-
-
-                if (runtimeEnd >
-                    maxAddress) {
-
-                    maxAddress =
-                        runtimeEnd;
-                }
+                    runtimeStart +
+                    (uint64_t)
+                        segment->vmsize;
 
 
                 if (address >=
@@ -576,7 +575,7 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "IMAGE TARGET v2.7\n\n"
+             "IMAGE TARGET v2.7.1\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
              "Finding hottest thread...";
@@ -681,7 +680,7 @@ static void BHFCollectStats(void)
 
     [output appendFormat:
         @"BumbleHeatFix\n"
-         "IMAGE TARGET v2.7\n\n"
+         "IMAGE TARGET v2.7.1\n\n"
          "CPU: %.1f%%\n"
          "Peak: %.1f%%\n"
          "Memory: %lu MB\n\n",
@@ -724,7 +723,8 @@ static void BHFCollectStats(void)
         );
 
 
-    uint64_t offset = 0;
+    uint64_t offset =
+        0;
 
 
     if (image.found &&
@@ -768,15 +768,12 @@ static void BHFCollectStats(void)
 
         [output appendFormat:
             @"PATH:\n%@\n\n",
+
             [NSString
                 stringWithUTF8String:
                     image.imagePath]];
     }
 
-
-    /*
-     * Print the hottest few threads.
-     */
 
     [output appendString:
         @"OTHER HOT THREADS\n"];
@@ -851,7 +848,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Image Target v2.7 loaded"
+             "Image Target v2.7.1 loaded"
         );
 
 
