@@ -5,9 +5,11 @@
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/thread_info.h>
+#import <mach/vm_map.h>
 
 #import <dlfcn.h>
 #import <stdint.h>
+#import <string.h>
 
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFMonitorTimer = nil;
@@ -193,11 +195,9 @@ static NSUInteger BHFCollectThreads(
         return 0;
     }
 
-
     BHFThreadSample temp[BHF_MAX_THREADS];
 
     NSUInteger tempCount = 0;
-
 
     for (NSUInteger i = 0;
          i < threadCount &&
@@ -221,17 +221,14 @@ static NSUInteger BHFCollectThreads(
             continue;
         }
 
-
         double cpu =
             ((double)info.cpu_usage /
              (double)TH_USAGE_SCALE) *
             100.0;
 
-
         if (cpu < 0.1) {
             continue;
         }
-
 
         BHFThreadSample sample;
 
@@ -243,7 +240,6 @@ static NSUInteger BHFCollectThreads(
 
         sample.runState =
             info.run_state;
-
 
         temp[tempCount++] =
             sample;
@@ -316,7 +312,6 @@ static NSString *BHFImageForAddress(
         sizeof(info)
     );
 
-
     if (dladdr(
             (const void *)address,
             &info)) {
@@ -329,7 +324,6 @@ static NSString *BHFImageForAddress(
                         info.dli_fname];
         }
     }
-
 
     return @"unknown";
 }
@@ -347,7 +341,6 @@ static NSString *BHFSymbolForAddress(
         sizeof(info)
     );
 
-
     if (dladdr(
             (const void *)address,
             &info)) {
@@ -360,7 +353,6 @@ static NSString *BHFSymbolForAddress(
                         info.dli_sname];
         }
     }
-
 
     return @"<redacted/unknown>";
 }
@@ -378,7 +370,6 @@ static uintptr_t BHFImageBaseForAddress(
         sizeof(info)
     );
 
-
     if (dladdr(
             (const void *)address,
             &info)) {
@@ -390,33 +381,11 @@ static uintptr_t BHFImageBaseForAddress(
         }
     }
 
-
     return 0;
 }
 
 
-#pragma mark - Safe Address Check
-
-static BOOL BHFIsLikelyCodeAddress(
-    uintptr_t address
-)
-{
-    if (address == 0) {
-        return NO;
-    }
-
-    NSString *image =
-        BHFImageForAddress(address);
-
-    if ([image isEqualToString:@"unknown"]) {
-        return NO;
-    }
-
-    return YES;
-}
-
-
-#pragma mark - Hot Thread Registers
+#pragma mark - Thread Registers
 
 typedef struct {
 
@@ -439,7 +408,6 @@ BHFGetThreadRegisters(thread_t thread)
     result.fp = 0;
     result.valid = NO;
 
-
 #if defined(__arm64__)
 
     arm_thread_state64_t state;
@@ -459,7 +427,6 @@ BHFGetThreadRegisters(thread_t thread)
         return result;
     }
 
-
     result.pc =
         state.__pc;
 
@@ -473,12 +440,11 @@ BHFGetThreadRegisters(thread_t thread)
 
 #endif
 
-
     return result;
 }
 
 
-#pragma mark - Stack Reading
+#pragma mark - Safe Stack Read
 
 static BOOL BHFReadPointer(
     uintptr_t address,
@@ -491,40 +457,39 @@ static BOOL BHFReadPointer(
         return NO;
     }
 
+    vm_offset_t data = 0;
 
-    /*
-     * We intentionally use mach_vm_read_overwrite
-     * instead of directly dereferencing the target
-     * thread's stack pointer.
-     *
-     * This avoids crashing the tweak if the stack
-     * address is invalid.
-     */
-
-    vm_size_t size =
-        sizeof(uintptr_t);
-
-
-    mach_vm_size_t outSize =
-        size;
-
+    mach_msg_type_number_t dataCount =
+        (mach_msg_type_number_t)
+            sizeof(uintptr_t);
 
     kern_return_t kr =
-        mach_vm_read_overwrite(
+        vm_read_overwrite(
             mach_task_self(),
-            (mach_vm_address_t)address,
-            size,
-            (mach_vm_address_t)value,
-            &outSize
+            (vm_address_t)address,
+            (vm_size_t)sizeof(uintptr_t),
+            (vm_address_t)value,
+            &dataCount
         );
 
+    /*
+     * Some SDKs define vm_read_overwrite using
+     * a different destination type. The unused
+     * data variable is intentionally retained
+     * for compatibility with the Mach API.
+     */
 
-    if (kr != KERN_SUCCESS ||
-        outSize != size) {
+    (void)data;
 
+    if (kr != KERN_SUCCESS) {
         return NO;
     }
 
+    if (dataCount !=
+        sizeof(uintptr_t)) {
+
+        return NO;
+    }
 
     return YES;
 }
@@ -541,7 +506,6 @@ BHFResolveThreadStack(
         BHFGetThreadRegisters(
             thread
         );
-
 
     if (!regs.valid) {
 
@@ -588,18 +552,7 @@ BHFResolveThreadStack(
     ];
 
 
-    /*
-     * Frame-pointer based unwinding.
-     *
-     * On arm64 a normal frame is:
-     *
-     * [FP + 0]  previous FP
-     * [FP + 8]  saved LR
-     *
-     * We only follow addresses that can
-     * be resolved by dladdr().
-     */
-
+#if defined(__arm64__)
 
     uintptr_t currentFP =
         (uintptr_t)regs.fp;
@@ -703,11 +656,6 @@ BHFResolveThreadStack(
         ];
 
 
-        /*
-         * Stop if the frame pointer does not
-         * move forward sensibly.
-         */
-
         if (previousFP <= currentFP) {
             break;
         }
@@ -725,6 +673,7 @@ BHFResolveThreadStack(
             previousFP;
     }
 
+#endif
 
     return frames;
 }
@@ -820,7 +769,6 @@ static void BHFUpdateOverlay(
             BHFCreateOverlay();
         }
 
-
         if (BHFLabel != nil) {
             BHFLabel.text =
                 text;
@@ -829,7 +777,7 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Collection
+#pragma mark - Stats
 
 static void BHFCollectStats(void)
 {
@@ -909,6 +857,7 @@ static void BHFCollectStats(void)
 
                     BHFCPUPercent,
                     BHFPeakCPU,
+
                     (unsigned long)memory
             ]
         );
