@@ -3,13 +3,16 @@
 #import <QuartzCore/QuartzCore.h>
 
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <mach/thread_info.h>
 #import <mach/thread_act.h>
-#import <mach/arm/thread_status.h>
 
 #import <dlfcn.h>
-#import <stdint.h>
-#import <string.h>
+#import <mach-o/dyld.h>
+#import <mach-o/getsect.h>
+
+#include <stdint.h>
+#include <string.h>
 
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFMonitorTimer = nil;
@@ -20,8 +23,7 @@ static CFTimeInterval BHFPreviousTime = 0.0;
 static double BHFCPUPercent = 0.0;
 static double BHFPeakCPU = 0.0;
 
-#define BHF_MAX_THREADS 5
-#define BHF_MAX_STACK_FRAMES 10
+#define BHF_MAX_THREADS 6
 
 
 #pragma mark - Window
@@ -65,7 +67,7 @@ static UIWindow *BHFGetWindow(void)
 }
 
 
-#pragma mark - CPU
+#pragma mark - Process CPU
 
 static double BHFProcessCPUTime(void)
 {
@@ -143,25 +145,24 @@ typedef struct {
 
     integer_t runState;
 
-    integer_t flags;
-
-    integer_t suspendCount;
-
     uint64_t pc;
-
-    uint64_t fp;
 
 } BHFThreadSample;
 
 
-#pragma mark - Thread State
+#pragma mark - Thread PC
 
-static BOOL BHFGetThreadState(
+static BOOL BHFGetThreadPC(
     thread_t thread,
-    uint64_t *pcOut,
-    uint64_t *fpOut
+    uint64_t *pcOut
 )
 {
+    if (pcOut == NULL) {
+        return NO;
+    }
+
+    *pcOut = 0;
+
     arm_thread_state64_t state;
 
     mach_msg_type_number_t count =
@@ -179,52 +180,14 @@ static BOOL BHFGetThreadState(
         return NO;
     }
 
-    if (pcOut != NULL) {
-
-        *pcOut =
-            arm_thread_state64_get_pc(state);
-    }
-
-    if (fpOut != NULL) {
-
-        *fpOut =
-            arm_thread_state64_get_fp(state);
-    }
+    *pcOut =
+        arm_thread_state64_get_pc(state);
 
     return YES;
 }
 
 
-#pragma mark - Run State
-
-static NSString *BHFRunStateName(
-    integer_t state
-)
-{
-    switch (state) {
-
-        case TH_STATE_RUNNING:
-            return @"RUNNING";
-
-        case TH_STATE_WAITING:
-            return @"WAITING";
-
-        case TH_STATE_STOPPED:
-            return @"STOPPED";
-
-        case TH_STATE_UNINTERRUPTIBLE:
-            return @"UNINTERRUPTIBLE";
-
-        case TH_STATE_HALTED:
-            return @"HALTED";
-
-        default:
-            return @"UNKNOWN";
-    }
-}
-
-
-#pragma mark - Thread Collection
+#pragma mark - Collect Threads
 
 static NSUInteger BHFCollectThreads(
     BHFThreadSample *samples,
@@ -305,17 +268,10 @@ static NSUInteger BHFCollectThreads(
         sample.runState =
             info.run_state;
 
-        sample.flags =
-            info.flags;
 
-        sample.suspendCount =
-            info.suspend_count;
-
-
-        BHFGetThreadState(
+        BHFGetThreadPC(
             threadList[i],
-            &sample.pc,
-            &sample.fp
+            &sample.pc
         );
 
 
@@ -380,235 +336,177 @@ static NSUInteger BHFCollectThreads(
 }
 
 
-#pragma mark - Symbol Information
+#pragma mark - Image Lookup
 
-static NSString *BHFImageNameForAddress(
-    uint64_t address,
-    NSString **symbolOut,
-    uint64_t *offsetOut
+typedef struct {
+
+    BOOL found;
+
+    uint64_t imageBase;
+
+    uint64_t imageEnd;
+
+    const char *imagePath;
+
+} BHFImageInfo;
+
+
+static BHFImageInfo BHFFindImage(
+    uint64_t address
 )
 {
-    if (symbolOut != NULL) {
-        *symbolOut = @"unknown";
-    }
-
-    if (offsetOut != NULL) {
-        *offsetOut = 0;
-    }
-
-
-    if (address == 0) {
-        return @"unknown";
-    }
-
-
-    Dl_info info;
+    BHFImageInfo result;
 
     memset(
-        &info,
+        &result,
         0,
-        sizeof(info)
+        sizeof(result)
     );
 
 
-    if (dladdr(
-            (const void *)(uintptr_t)address,
-            &info
-        ) == 0) {
+    uint32_t imageCount =
+        _dyld_image_count();
 
+
+    for (uint32_t i = 0;
+         i < imageCount;
+         i++) {
+
+        const struct mach_header_64 *header =
+            (const struct mach_header_64 *)
+                _dyld_get_image_header(i);
+
+
+        if (header == NULL) {
+            continue;
+        }
+
+
+        intptr_t slide =
+            _dyld_get_image_vmaddr_slide(i);
+
+
+        uint64_t base =
+            (uint64_t)(
+                (uintptr_t)header
+            );
+
+
+        uint64_t maxAddress =
+            base;
+
+
+        const uint8_t *cursor =
+            (const uint8_t *)header +
+            sizeof(struct mach_header_64);
+
+
+        const struct load_command *command;
+
+
+        for (uint32_t commandIndex = 0;
+             commandIndex <
+                 header->ncmds;
+             commandIndex++) {
+
+            command =
+                (const struct load_command *)
+                    cursor;
+
+
+            if (command->cmd ==
+                LC_SEGMENT_64) {
+
+                const struct
+                    segment_command_64 *segment =
+                    (const struct
+                        segment_command_64 *)
+                        command;
+
+
+                uint64_t segmentStart =
+                    (uint64_t)
+                        segment->vmaddr;
+
+
+                uint64_t segmentEnd =
+                    segmentStart +
+                    segment->vmsize;
+
+
+                uint64_t runtimeStart =
+                    segmentStart +
+                    slide;
+
+
+                uint64_t runtimeEnd =
+                    segmentEnd +
+                    slide;
+
+
+                if (runtimeEnd >
+                    maxAddress) {
+
+                    maxAddress =
+                        runtimeEnd;
+                }
+
+
+                if (address >=
+                        runtimeStart &&
+                    address <
+                        runtimeEnd) {
+
+                    result.found =
+                        YES;
+
+                    result.imageBase =
+                        runtimeStart;
+
+                    result.imageEnd =
+                        runtimeEnd;
+
+                    result.imagePath =
+                        _dyld_get_image_name(i);
+
+                    return result;
+                }
+            }
+
+
+            cursor +=
+                command->cmdsize;
+        }
+    }
+
+
+    return result;
+}
+
+
+#pragma mark - Image Name
+
+static NSString *BHFImageName(
+    const char *path
+)
+{
+    if (path == NULL) {
         return @"unknown";
     }
 
 
-    NSString *imageName =
-        @"unknown";
+    NSString *full =
+        [NSString
+            stringWithUTF8String:path];
 
 
-    if (info.dli_fname != NULL) {
-
-        imageName =
-            [NSString
-                stringWithUTF8String:
-                    info.dli_fname];
+    if (full == nil) {
+        return @"unknown";
     }
 
 
-    if (symbolOut != NULL &&
-        info.dli_sname != NULL) {
-
-        *symbolOut =
-            [NSString
-                stringWithUTF8String:
-                    info.dli_sname];
-    }
-
-
-    if (offsetOut != NULL &&
-        info.dli_saddr != NULL) {
-
-        *offsetOut =
-            address -
-            (uint64_t)(uintptr_t)
-                info.dli_saddr;
-    }
-
-
-    return imageName;
-}
-
-
-#pragma mark - Frame Reader
-
-static BOOL BHFReadFrame(
-    uint64_t framePointer,
-    uint64_t *nextFrame,
-    uint64_t *returnAddress
-)
-{
-    if (framePointer == 0 ||
-        nextFrame == NULL ||
-        returnAddress == NULL) {
-
-        return NO;
-    }
-
-
-    /*
-     * ARM64 frame record:
-     *
-     * +0  previous FP
-     * +8  saved LR
-     */
-
-
-    if (framePointer & 0x7) {
-        return NO;
-    }
-
-
-    /*
-     * Avoid following obviously
-     * unreasonable frame pointers.
-     */
-
-    if (framePointer < 0x100000000ULL) {
-        return NO;
-    }
-
-
-    uint64_t *frame =
-        (uint64_t *)(uintptr_t)
-            framePointer;
-
-
-    uint64_t previousFP =
-        frame[0];
-
-    uint64_t savedLR =
-        frame[1];
-
-
-    if (previousFP == 0 ||
-        savedLR == 0) {
-
-        return NO;
-    }
-
-
-    /*
-     * Frame chains normally move
-     * toward higher addresses.
-     */
-
-    if (previousFP <= framePointer) {
-        return NO;
-    }
-
-
-    /*
-     * Don't follow a suspiciously
-     * huge jump.
-     */
-
-    if ((previousFP -
-         framePointer) >
-        (1024ULL * 1024ULL)) {
-
-        return NO;
-    }
-
-
-    *nextFrame =
-        previousFP;
-
-    *returnAddress =
-        savedLR;
-
-
-    return YES;
-}
-
-
-#pragma mark - Stack Collection
-
-static NSUInteger BHFCollectStack(
-    BHFThreadSample sample,
-    uint64_t *addresses,
-    NSUInteger maximum
-)
-{
-    if (addresses == NULL ||
-        maximum == 0) {
-
-        return 0;
-    }
-
-
-    NSUInteger count = 0;
-
-
-    /*
-     * Frame zero = current PC.
-     */
-
-    if (sample.pc != 0) {
-
-        addresses[count++] =
-            sample.pc;
-    }
-
-
-    uint64_t fp =
-        sample.fp;
-
-
-    while (count < maximum) {
-
-        uint64_t nextFP = 0;
-
-        uint64_t returnAddress = 0;
-
-
-        if (!BHFReadFrame(
-                fp,
-                &nextFP,
-                &returnAddress
-            )) {
-
-            break;
-        }
-
-
-        addresses[count++] =
-            returnAddress;
-
-
-        fp =
-            nextFP;
-    }
-
-
-    return count;
+    return
+        [full lastPathComponent];
 }
 
 
@@ -678,10 +576,10 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "CALLER TARGET v2.6\n\n"
+             "IMAGE TARGET v2.7\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
-             "Finding hot thread...";
+             "Finding hottest thread...";
 
 
         [window addSubview:BHFLabel];
@@ -710,7 +608,7 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Statistics
+#pragma mark - Monitor
 
 static void BHFCollectStats(void)
 {
@@ -783,7 +681,7 @@ static void BHFCollectStats(void)
 
     [output appendFormat:
         @"BumbleHeatFix\n"
-         "CALLER TARGET v2.6\n\n"
+         "IMAGE TARGET v2.7\n\n"
          "CPU: %.1f%%\n"
          "Peak: %.1f%%\n"
          "Memory: %lu MB\n\n",
@@ -799,7 +697,8 @@ static void BHFCollectStats(void)
     if (count == 0) {
 
         [output appendString:
-            @"No active threads.\n"];
+            @"No active CPU threads.\n"];
+
 
         BHFUpdateOverlay(
             output
@@ -813,11 +712,38 @@ static void BHFCollectStats(void)
         samples[0];
 
 
+    BHFImageInfo image =
+        BHFFindImage(
+            hot.pc
+        );
+
+
+    NSString *imageName =
+        BHFImageName(
+            image.imagePath
+        );
+
+
+    uint64_t offset = 0;
+
+
+    if (image.found &&
+        hot.pc >=
+            image.imageBase) {
+
+        offset =
+            hot.pc -
+            image.imageBase;
+    }
+
+
     [output appendFormat:
         @"HOT THREAD\n"
          "T%u  %.1f%%  %@\n"
          "PC: 0x%llx\n"
-         "FP: 0x%llx\n\n",
+         "IMAGE: %@\n"
+         "BASE: 0x%llx\n"
+         "OFFSET: +0x%llx\n\n",
 
         hot.thread,
 
@@ -829,169 +755,85 @@ static void BHFCollectStats(void)
 
         hot.pc,
 
-        hot.fp
+        imageName,
+
+        image.imageBase,
+
+        offset
     ];
 
 
-    uint64_t stack[
-        BHF_MAX_STACK_FRAMES];
+    if (image.found &&
+        image.imagePath != NULL) {
 
-
-    memset(
-        stack,
-        0,
-        sizeof(stack)
-    );
-
-
-    NSUInteger stackCount =
-        BHFCollectStack(
-            hot,
-            stack,
-            BHF_MAX_STACK_FRAMES
-        );
-
-
-    [output appendString:
-        @"TARGET STACK\n"];
-
-
-    if (stackCount == 0) {
-
-        [output appendString:
-            @"Unable to read stack.\n"];
-
-    } else {
-
-        for (NSUInteger i = 0;
-             i < stackCount;
-             i++) {
-
-            NSString *symbol =
-                @"unknown";
-
-
-            uint64_t offset = 0;
-
-
-            NSString *image =
-                BHFImageNameForAddress(
-                    stack[i],
-                    &symbol,
-                    &offset
-                );
-
-
-            NSString *imageName =
-                [image lastPathComponent];
-
-
-            /*
-             * For Bumble itself,
-             * the useful value is the
-             * module-relative offset.
-             */
-
-            BOOL isBumble =
-                [imageName
-                    caseInsensitiveCompare:
-                        @"Bumble"] == NSOrderedSame;
-
-
-            if (isBumble) {
-
-                [output appendFormat:
-                    @"#%lu 0x%llx\n"
-                     "    BUMBLE + 0x%llx\n"
-                     "    %@\n",
-
-                    (unsigned long)i,
-
-                    stack[i],
-
-                    offset,
-
-                    symbol
-                ];
-
-            } else {
-
-                [output appendFormat:
-                    @"#%lu 0x%llx\n"
-                     "    %@ + 0x%llx\n"
-                     "    %@\n",
-
-                    (unsigned long)i,
-
-                    stack[i],
-
-                    imageName,
-
-                    offset,
-
-                    symbol
-                ];
-            }
-        }
+        [output appendFormat:
+            @"PATH:\n%@\n\n",
+            [NSString
+                stringWithUTF8String:
+                    image.imagePath]];
     }
 
 
     /*
-     * Other hot threads.
+     * Print the hottest few threads.
      */
 
-    if (count > 1) {
-
-        [output appendString:
-            @"\nOTHER THREADS\n"];
+    [output appendString:
+        @"OTHER HOT THREADS\n"];
 
 
-        for (NSUInteger i = 1;
-             i < count;
-             i++) {
+    for (NSUInteger i = 1;
+         i < count;
+         i++) {
 
-            BHFThreadSample sample =
-                samples[i];
-
-
-            NSString *symbol =
-                @"unknown";
+        BHFThreadSample sample =
+            samples[i];
 
 
-            uint64_t offset = 0;
+        BHFImageInfo otherImage =
+            BHFFindImage(
+                sample.pc
+            );
 
 
-            NSString *image =
-                BHFImageNameForAddress(
-                    sample.pc,
-                    &symbol,
-                    &offset
-                );
+        NSString *otherName =
+            BHFImageName(
+                otherImage.imagePath
+            );
 
 
-            NSString *imageName =
-                [image lastPathComponent];
+        uint64_t otherOffset =
+            0;
 
 
-            [output appendFormat:
-                @"%lu. T%u %.1f%% %@\n"
-                 "    %@ + 0x%llx\n",
+        if (otherImage.found &&
+            sample.pc >=
+                otherImage.imageBase) {
 
-                (unsigned long)(i + 1),
-
-                sample.thread,
-
-                sample.cpu,
-
-                BHFRunStateName(
-                    sample.runState
-                ),
-
-                imageName,
-
-                offset
-            ];
+            otherOffset =
+                sample.pc -
+                otherImage.imageBase;
         }
+
+
+        [output appendFormat:
+            @"%lu. T%u %.1f%% %@\n"
+             "    %@ + 0x%llx\n",
+
+            (unsigned long)(i + 1),
+
+            sample.thread,
+
+            sample.cpu,
+
+            BHFRunStateName(
+                sample.runState
+            ),
+
+            otherName,
+
+            otherOffset
+        ];
     }
 
 
@@ -1009,7 +851,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Caller Target v2.6 loaded"
+             "Image Target v2.7 loaded"
         );
 
 
