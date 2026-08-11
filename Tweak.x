@@ -8,7 +8,6 @@
 #import <mach/arm/thread_status.h>
 
 #import <dlfcn.h>
-#import <mach-o/dyld.h>
 
 #include <stdint.h>
 #include <string.h>
@@ -68,9 +67,7 @@ static UIWindow *BHFGetWindow(void)
 
 #pragma mark - Run State
 
-static NSString *BHFRunStateName(
-    integer_t state
-)
+static NSString *BHFRunStateName(integer_t state)
 {
     switch (state) {
 
@@ -215,7 +212,7 @@ static BOOL BHFGetThreadPC(
 }
 
 
-#pragma mark - Collect Threads
+#pragma mark - Thread Collection
 
 static NSUInteger BHFCollectThreads(
     BHFThreadSample *samples,
@@ -364,26 +361,33 @@ static NSUInteger BHFCollectThreads(
 }
 
 
-#pragma mark - Image Information
+#pragma mark - dladdr Resolver
 
 typedef struct {
 
     BOOL found;
 
+    NSString *imageName;
+
+    NSString *imagePath;
+
+    NSString *symbolName;
+
     uint64_t imageBase;
 
-    uint64_t imageEnd;
+    uint64_t symbolAddress;
 
-    const char *imagePath;
+    uint64_t imageOffset;
 
-} BHFImageInfo;
+    uint64_t symbolOffset;
+
+} BHFResolvedAddress;
 
 
-static BHFImageInfo BHFFindImage(
-    uint64_t address
-)
+static BHFResolvedAddress
+BHFResolveAddress(uint64_t address)
 {
-    BHFImageInfo result;
+    BHFResolvedAddress result;
 
     memset(
         &result,
@@ -392,120 +396,104 @@ static BHFImageInfo BHFFindImage(
     );
 
 
-    uint32_t imageCount =
-        _dyld_image_count();
+    if (address == 0) {
+        return result;
+    }
 
 
-    for (uint32_t i = 0;
-         i < imageCount;
-         i++) {
+    Dl_info info;
 
-        const struct mach_header_64 *header =
-            (const struct mach_header_64 *)
-                _dyld_get_image_header(i);
-
-
-        if (header == NULL) {
-            continue;
-        }
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
 
 
-        intptr_t slide =
-            _dyld_get_image_vmaddr_slide(i);
+    int success =
+        dladdr(
+            (const void *)(uintptr_t)address,
+            &info
+        );
 
 
-        const uint8_t *cursor =
-            (const uint8_t *)header +
-            sizeof(struct mach_header_64);
+    if (!success) {
+        return result;
+    }
 
 
-        for (uint32_t commandIndex = 0;
-             commandIndex <
-                 header->ncmds;
-             commandIndex++) {
-
-            const struct load_command *command =
-                (const struct load_command *)
-                    cursor;
+    result.found = YES;
 
 
-            if (command->cmd ==
-                LC_SEGMENT_64) {
+    if (info.dli_fname != NULL) {
 
-                const struct
-                    segment_command_64 *segment =
-                    (const struct
-                        segment_command_64 *)
-                        command;
+        result.imagePath =
+            [NSString
+                stringWithUTF8String:
+                    info.dli_fname];
 
+        result.imageName =
+            [result.imagePath
+                lastPathComponent];
+    }
+    else {
 
-                uint64_t runtimeStart =
-                    ((uint64_t)
-                        segment->vmaddr) +
-                    (uint64_t)slide;
-
-
-                uint64_t runtimeEnd =
-                    runtimeStart +
-                    (uint64_t)
-                        segment->vmsize;
+        result.imageName =
+            @"unknown";
+    }
 
 
-                if (address >=
-                        runtimeStart &&
-                    address <
-                        runtimeEnd) {
+    if (info.dli_fbase != NULL) {
 
-                    result.found =
-                        YES;
-
-                    result.imageBase =
-                        runtimeStart;
-
-                    result.imageEnd =
-                        runtimeEnd;
-
-                    result.imagePath =
-                        _dyld_get_image_name(i);
-
-                    return result;
-                }
-            }
+        result.imageBase =
+            (uint64_t)
+                (uintptr_t)
+                    info.dli_fbase;
+    }
 
 
-            cursor +=
-                command->cmdsize;
-        }
+    if (info.dli_sname != NULL) {
+
+        result.symbolName =
+            [NSString
+                stringWithUTF8String:
+                    info.dli_sname];
+    }
+    else {
+
+        result.symbolName =
+            @"<no symbol>";
+    }
+
+
+    if (info.dli_saddr != NULL) {
+
+        result.symbolAddress =
+            (uint64_t)
+                (uintptr_t)
+                    info.dli_saddr;
+    }
+
+
+    if (result.imageBase != 0 &&
+        address >= result.imageBase) {
+
+        result.imageOffset =
+            address -
+            result.imageBase;
+    }
+
+
+    if (result.symbolAddress != 0 &&
+        address >= result.symbolAddress) {
+
+        result.symbolOffset =
+            address -
+            result.symbolAddress;
     }
 
 
     return result;
-}
-
-
-#pragma mark - Image Name
-
-static NSString *BHFImageName(
-    const char *path
-)
-{
-    if (path == NULL) {
-        return @"unknown";
-    }
-
-
-    NSString *full =
-        [NSString
-            stringWithUTF8String:path];
-
-
-    if (full == nil) {
-        return @"unknown";
-    }
-
-
-    return
-        [full lastPathComponent];
 }
 
 
@@ -575,10 +563,10 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "IMAGE TARGET v2.7.1\n\n"
+             "SYMBOL RESOLVER v2.8\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
-             "Finding hottest thread...";
+             "Resolving hottest thread...";
 
 
         [window addSubview:BHFLabel];
@@ -680,7 +668,7 @@ static void BHFCollectStats(void)
 
     [output appendFormat:
         @"BumbleHeatFix\n"
-         "IMAGE TARGET v2.7.1\n\n"
+         "SYMBOL RESOLVER v2.8\n\n"
          "CPU: %.1f%%\n"
          "Peak: %.1f%%\n"
          "Memory: %lu MB\n\n",
@@ -711,39 +699,18 @@ static void BHFCollectStats(void)
         samples[0];
 
 
-    BHFImageInfo image =
-        BHFFindImage(
+    BHFResolvedAddress resolved =
+        BHFResolveAddress(
             hot.pc
         );
 
 
-    NSString *imageName =
-        BHFImageName(
-            image.imagePath
-        );
-
-
-    uint64_t offset =
-        0;
-
-
-    if (image.found &&
-        hot.pc >=
-            image.imageBase) {
-
-        offset =
-            hot.pc -
-            image.imageBase;
-    }
+    [output appendString:
+        @"HOT THREAD\n"];
 
 
     [output appendFormat:
-        @"HOT THREAD\n"
-         "T%u  %.1f%%  %@\n"
-         "PC: 0x%llx\n"
-         "IMAGE: %@\n"
-         "BASE: 0x%llx\n"
-         "OFFSET: +0x%llx\n\n",
+        @"T%u  %.1f%%  %@\n",
 
         hot.thread,
 
@@ -751,32 +718,72 @@ static void BHFCollectStats(void)
 
         BHFRunStateName(
             hot.runState
-        ),
-
-        hot.pc,
-
-        imageName,
-
-        image.imageBase,
-
-        offset
+        )
     ];
 
 
-    if (image.found &&
-        image.imagePath != NULL) {
+    [output appendFormat:
+        @"PC: 0x%llx\n",
+
+        hot.pc
+    ];
+
+
+    if (resolved.found) {
 
         [output appendFormat:
-            @"PATH:\n%@\n\n",
+            @"IMAGE: %@\n"
+             "BASE: 0x%llx\n"
+             "OFFSET: +0x%llx\n",
 
-            [NSString
-                stringWithUTF8String:
-                    image.imagePath]];
+            resolved.imageName,
+
+            resolved.imageBase,
+
+            resolved.imageOffset
+        ];
+
+
+        [output appendFormat:
+            @"SYMBOL: %@\n",
+
+            resolved.symbolName
+        ];
+
+
+        if (resolved.symbolAddress != 0) {
+
+            [output appendFormat:
+                @"SYMBOL ADDR: 0x%llx\n"
+                 "SYMBOL + OFFSET: +0x%llx\n",
+
+                resolved.symbolAddress,
+
+                resolved.symbolOffset
+            ];
+        }
+
+
+        if (resolved.imagePath != nil) {
+
+            [output appendFormat:
+                @"PATH:\n%@\n",
+
+                resolved.imagePath
+            ];
+        }
+
+    }
+    else {
+
+        [output appendString:
+            @"IMAGE: <unresolved>\n"
+             "SYMBOL: <unresolved>\n"];
     }
 
 
     [output appendString:
-        @"OTHER HOT THREADS\n"];
+        @"\nOTHER HOT THREADS\n"];
 
 
     for (NSUInteger i = 1;
@@ -787,35 +794,34 @@ static void BHFCollectStats(void)
             samples[i];
 
 
-        BHFImageInfo otherImage =
-            BHFFindImage(
+        BHFResolvedAddress other =
+            BHFResolveAddress(
                 sample.pc
             );
 
 
-        NSString *otherName =
-            BHFImageName(
-                otherImage.imagePath
-            );
+        NSString *name =
+            other.found
+                ? other.imageName
+                : @"unknown";
 
 
-        uint64_t otherOffset =
-            0;
+        NSString *symbol =
+            other.found
+                ? other.symbolName
+                : @"<none>";
 
 
-        if (otherImage.found &&
-            sample.pc >=
-                otherImage.imageBase) {
-
-            otherOffset =
-                sample.pc -
-                otherImage.imageBase;
-        }
+        uint64_t offset =
+            other.found
+                ? other.imageOffset
+                : 0;
 
 
         [output appendFormat:
             @"%lu. T%u %.1f%% %@\n"
-             "    %@ + 0x%llx\n",
+             "    %@ + 0x%llx\n"
+             "    %@\n",
 
             (unsigned long)(i + 1),
 
@@ -827,9 +833,11 @@ static void BHFCollectStats(void)
                 sample.runState
             ),
 
-            otherName,
+            name,
 
-            otherOffset
+            offset,
+
+            symbol
         ];
     }
 
@@ -848,7 +856,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Image Target v2.7.1 loaded"
+             "Symbol Resolver v2.8 loaded"
         );
 
 
