@@ -7,6 +7,7 @@
 #import <mach/thread_info.h>
 
 #import <dlfcn.h>
+#import <execinfo.h>
 
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFMonitorTimer = nil;
@@ -18,7 +19,14 @@ static double BHFCPUPercent = 0.0;
 static double BHFPeakCPU = 0.0;
 
 static NSUInteger BHFHotSamples = 0;
+
 static thread_t BHFLastHotThread = MACH_PORT_NULL;
+
+
+/*
+ * Maximum number of stack addresses we display.
+ */
+#define BHF_MAX_STACK 8
 
 
 #pragma mark - Window
@@ -165,140 +173,10 @@ typedef struct {
     thread_t thread;
     double cpu;
     integer_t runState;
-    uint64_t pc;
 } BHFThreadSample;
 
 
-#pragma mark - Resolve PC
-
-static NSString *BHFResolveImage(uint64_t address)
-{
-    if (address == 0) {
-        return @"unknown";
-    }
-
-    Dl_info info;
-
-    memset(
-        &info,
-        0,
-        sizeof(info)
-    );
-
-    if (dladdr(
-            (const void *)(uintptr_t)address,
-            &info)) {
-
-        if (info.dli_fname != NULL) {
-            return
-                [NSString
-                    stringWithUTF8String:
-                        info.dli_fname];
-        }
-    }
-
-    return @"unknown";
-}
-
-
-static NSString *BHFResolveSymbol(uint64_t address)
-{
-    if (address == 0) {
-        return @"unknown";
-    }
-
-    Dl_info info;
-
-    memset(
-        &info,
-        0,
-        sizeof(info)
-    );
-
-    if (dladdr(
-            (const void *)(uintptr_t)address,
-            &info)) {
-
-        if (info.dli_sname != NULL) {
-            return
-                [NSString
-                    stringWithUTF8String:
-                        info.dli_sname];
-        }
-    }
-
-    return @"unknown";
-}
-
-
-static uint64_t BHFResolveSymbolAddress(
-    uint64_t address
-)
-{
-    if (address == 0) {
-        return 0;
-    }
-
-    Dl_info info;
-
-    memset(
-        &info,
-        0,
-        sizeof(info)
-    );
-
-    if (dladdr(
-            (const void *)(uintptr_t)address,
-            &info)) {
-
-        if (info.dli_saddr != NULL) {
-            return
-                (uint64_t)(uintptr_t)
-                    info.dli_saddr;
-        }
-    }
-
-    return 0;
-}
-
-
-#pragma mark - Thread PC
-
-static uint64_t BHFThreadPC(
-    thread_t thread
-)
-{
-#if defined(__arm64__)
-
-    arm_thread_state64_t state;
-
-    mach_msg_type_number_t count =
-        ARM_THREAD_STATE64_COUNT;
-
-    kern_return_t kr =
-        thread_get_state(
-            thread,
-            ARM_THREAD_STATE64,
-            (thread_state_t)&state,
-            &count
-        );
-
-    if (kr != KERN_SUCCESS) {
-        return 0;
-    }
-
-    return
-        (uint64_t)state.__pc;
-
-#else
-
-    return 0;
-
-#endif
-}
-
-
-#pragma mark - Collect Threads
+#pragma mark - Thread CPU Collection
 
 static NSUInteger BHFCollectThreads(
     BHFThreadSample *samples,
@@ -373,11 +251,6 @@ static NSUInteger BHFCollectThreads(
         sample.runState =
             info.run_state;
 
-        sample.pc =
-            BHFThreadPC(
-                threadList[i]
-            );
-
 
         temp[tempCount] =
             sample;
@@ -387,8 +260,8 @@ static NSUInteger BHFCollectThreads(
 
 
     /*
-     Sort hottest thread first.
-    */
+     * Sort highest CPU first.
+     */
 
     for (NSUInteger i = 0;
          i < tempCount;
@@ -441,6 +314,213 @@ static NSUInteger BHFCollectThreads(
 }
 
 
+#pragma mark - Symbol Resolver
+
+static NSString *BHFImageForAddress(
+    uintptr_t address
+)
+{
+    Dl_info info;
+
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
+
+
+    if (dladdr(
+            (const void *)address,
+            &info)) {
+
+        if (info.dli_fname != NULL) {
+
+            return
+                [NSString
+                    stringWithUTF8String:
+                        info.dli_fname];
+        }
+    }
+
+
+    return @"unknown";
+}
+
+
+static NSString *BHFSymbolForAddress(
+    uintptr_t address
+)
+{
+    Dl_info info;
+
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
+
+
+    if (dladdr(
+            (const void *)address,
+            &info)) {
+
+        if (info.dli_sname != NULL) {
+
+            return
+                [NSString
+                    stringWithUTF8String:
+                        info.dli_sname];
+        }
+    }
+
+
+    return @"unknown";
+}
+
+
+static uintptr_t BHFImageBaseForAddress(
+    uintptr_t address
+)
+{
+    Dl_info info;
+
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
+
+
+    if (dladdr(
+            (const void *)address,
+            &info)) {
+
+        if (info.dli_fbase != NULL) {
+
+            return
+                (uintptr_t)
+                    info.dli_fbase;
+        }
+    }
+
+
+    return 0;
+}
+
+
+#pragma mark - Capture Current Thread Stack
+
+static NSArray<NSString *> *
+BHFCaptureCurrentStack(void)
+{
+    void *addresses[BHF_MAX_STACK];
+
+    int count =
+        backtrace(
+            addresses,
+            BHF_MAX_STACK
+        );
+
+
+    if (count <= 0) {
+
+        return @[
+            @"<no stack available>"
+        ];
+    }
+
+
+    NSMutableArray<NSString *> *result =
+        [NSMutableArray array];
+
+
+    for (int i = 0;
+         i < count;
+         i++) {
+
+        uintptr_t address =
+            (uintptr_t)addresses[i];
+
+
+        NSString *image =
+            BHFImageForAddress(
+                address
+            );
+
+
+        NSString *symbol =
+            BHFSymbolForAddress(
+                address
+            );
+
+
+        uintptr_t base =
+            BHFImageBaseForAddress(
+                address
+            );
+
+
+        uintptr_t offset =
+            0;
+
+
+        if (base != 0 &&
+            address >= base) {
+
+            offset =
+                address - base;
+        }
+
+
+        NSString *line;
+
+
+        if (![symbol isEqualToString:
+                @"unknown"]) {
+
+            line =
+                [NSString
+                    stringWithFormat:
+                        @"#%d 0x%lx\n%@ + 0x%lx\n%@",
+
+                    i,
+
+                    (unsigned long)address,
+
+                    image,
+
+                    (unsigned long)offset,
+
+                    symbol
+                ];
+
+        } else {
+
+            line =
+                [NSString
+                    stringWithFormat:
+                        @"#%d 0x%lx\n%@ + 0x%lx\n<unknown>",
+
+                    i,
+
+                    (unsigned long)address,
+
+                    image,
+
+                    (unsigned long)offset
+                ];
+        }
+
+
+        [result addObject:
+            line];
+    }
+
+
+    return result;
+}
+
+
 #pragma mark - Overlay
 
 static void BHFCreateOverlay(void)
@@ -470,7 +550,7 @@ static void BHFCreateOverlay(void)
                         6,
                         45,
                         405,
-                        560
+                        650
                     )];
 
 
@@ -485,7 +565,7 @@ static void BHFCreateOverlay(void)
         BHFLabel.font =
             [UIFont
                 monospacedSystemFontOfSize:
-                    10.0
+                    9.0
                 weight:
                     UIFontWeightMedium];
 
@@ -497,7 +577,7 @@ static void BHFCreateOverlay(void)
         BHFLabel.backgroundColor =
             [[UIColor blackColor]
                 colorWithAlphaComponent:
-                    0.90];
+                    0.92];
 
 
         BHFLabel.layer.cornerRadius =
@@ -510,13 +590,11 @@ static void BHFCreateOverlay(void)
 
         BHFLabel.text =
             @"BumbleHeatFix\n"
-             "HOT THREAD RESOLVER v3.0\n\n"
+             "STACK CAPTURE v3.1\n\n"
              "CPU: measuring...\n"
              "Peak: measuring...\n"
-             "Hot thread: searching...\n"
-             "PC: searching...\n"
-             "Image: searching...\n"
-             "Symbol: searching...";
+             "Hot thread: searching...\n\n"
+             "Waiting for hot stack...";
 
 
         [window addSubview:BHFLabel];
@@ -538,6 +616,7 @@ static void BHFUpdateOverlay(
 
 
         if (BHFLabel != nil) {
+
             BHFLabel.text =
                 text;
         }
@@ -545,7 +624,7 @@ static void BHFUpdateOverlay(
 }
 
 
-#pragma mark - Collect Statistics
+#pragma mark - Statistics
 
 static void BHFCollectStats(void)
 {
@@ -611,18 +690,33 @@ static void BHFCollectStats(void)
         BHFMemoryMB();
 
 
-    BOOL hot =
-        NO;
+    if (count == 0) {
 
+        BHFUpdateOverlay(
+            [NSString
+                stringWithFormat:
+                    @"BumbleHeatFix\n"
+                     "STACK CAPTURE v3.1\n\n"
+                     "CPU: %.1f%%\n"
+                     "Peak: %.1f%%\n"
+                     "Memory: %lu MB\n\n"
+                     "No active CPU threads.",
 
-    if (count > 0 &&
-        samples[0].cpu >= 85.0) {
+                    BHFCPUPercent,
+                    BHFPeakCPU,
+                    (unsigned long)memory
+            ]
+        );
 
-        hot = YES;
+        return;
     }
 
 
-    if (hot) {
+    BHFThreadSample hot =
+        samples[0];
+
+
+    if (hot.cpu >= 85.0) {
 
         BHFHotSamples++;
 
@@ -632,13 +726,33 @@ static void BHFCollectStats(void)
     }
 
 
+    BHFLastHotThread =
+        hot.thread;
+
+
+    /*
+     * Important:
+     *
+     * backtrace() captures the CURRENT
+     * thread, not an arbitrary Mach thread.
+     *
+     * Therefore this diagnostic version
+     * performs the stack capture on the
+     * monitor thread only when requested
+     * through the hot-thread diagnostic path.
+     *
+     * The CPU/thread information below is
+     * still valid for the selected hot thread.
+     */
+
+
     NSMutableString *output =
         [NSMutableString string];
 
 
     [output appendFormat:
         @"BumbleHeatFix\n"
-         "HOT THREAD RESOLVER v3.0\n\n"
+         "STACK CAPTURE v3.1\n\n"
          "CPU: %.1f%%\n"
          "Peak: %.1f%%\n"
          "Memory: %lu MB\n"
@@ -651,128 +765,171 @@ static void BHFCollectStats(void)
     ];
 
 
-    if (count == 0) {
-
-        [output appendString:
-            @"No active CPU threads.\n"];
-
-
-        BHFUpdateOverlay(
-            output
-        );
-
-        return;
-    }
-
-
-    BHFThreadSample hotThread =
-        samples[0];
-
-
-    BHFLastHotThread =
-        hotThread.thread;
-
-
-    NSString *image =
-        BHFResolveImage(
-            hotThread.pc
-        );
-
-
-    NSString *symbol =
-        BHFResolveSymbol(
-            hotThread.pc
-        );
-
-
-    uint64_t symbolAddress =
-        BHFResolveSymbolAddress(
-            hotThread.pc
-        );
-
-
-    uint64_t symbolOffset = 0;
-
-
-    if (symbolAddress != 0 &&
-        hotThread.pc >=
-            symbolAddress) {
-
-        symbolOffset =
-            hotThread.pc -
-            symbolAddress;
-    }
-
-
     [output appendString:
         @"HOT THREAD\n"];
 
 
     [output appendFormat:
-        @"T%u %.1f%% %@\n",
+        @"T%u %.1f%% %@\n\n",
 
-        hotThread.thread,
-        hotThread.cpu,
+        hot.thread,
+        hot.cpu,
 
         BHFRunStateName(
-            hotThread.runState
+            hot.runState
         )
     ];
 
 
-    [output appendFormat:
-        @"PC: 0x%llx\n",
+    /*
+     * Resolve the selected thread's PC.
+     */
 
-        (unsigned long long)
-            hotThread.pc
-    ];
-
-
-    [output appendFormat:
-        @"IMAGE: %@\n",
-
-        image
-    ];
+    uint64_t pc = 0;
 
 
-    [output appendFormat:
-        @"SYMBOL: %@\n",
+#if defined(__arm64__)
 
-        symbol
-    ];
+    arm_thread_state64_t state;
+
+    mach_msg_type_number_t stateCount =
+        ARM_THREAD_STATE64_COUNT;
 
 
-    if (symbolAddress != 0) {
+    kern_return_t kr =
+        thread_get_state(
+            hot.thread,
+            ARM_THREAD_STATE64,
+            (thread_state_t)&state,
+            &stateCount
+        );
+
+
+    if (kr == KERN_SUCCESS) {
+
+        pc =
+            (uint64_t)state.__pc;
+    }
+
+#endif
+
+
+    if (pc != 0) {
+
+        NSString *image =
+            BHFImageForAddress(
+                (uintptr_t)pc
+            );
+
+
+        NSString *symbol =
+            BHFSymbolForAddress(
+                (uintptr_t)pc
+            );
+
+
+        uintptr_t base =
+            BHFImageBaseForAddress(
+                (uintptr_t)pc
+            );
+
+
+        uintptr_t offset =
+            0;
+
+
+        if (base != 0 &&
+            pc >= base) {
+
+            offset =
+                (uintptr_t)pc -
+                base;
+        }
+
+
+        [output appendString:
+            @"CURRENT PC\n"];
+
 
         [output appendFormat:
-            @"SYMBOL OFFSET: +0x%llx\n",
+            @"0x%llx\n",
 
-            (unsigned long long)
-                symbolOffset
+            (unsigned long long)pc
+        ];
+
+
+        [output appendFormat:
+            @"IMAGE: %@\n",
+
+            image
+        ];
+
+
+        [output appendFormat:
+            @"OFFSET: +0x%lx\n",
+
+            (unsigned long)offset
+        ];
+
+
+        [output appendFormat:
+            @"SYMBOL: %@\n\n",
+
+            symbol
         ];
 
     } else {
 
         [output appendString:
-            @"SYMBOL OFFSET: unavailable\n"];
+            @"CURRENT PC\n"
+             "Unavailable\n\n"];
+    }
+
+
+    /*
+     * Capture the monitor thread's own
+     * stack only as a reference. It is
+     * explicitly labeled so it cannot
+     * be mistaken for the hot thread.
+     */
+
+    NSArray<NSString *> *monitorStack =
+        BHFCaptureCurrentStack();
+
+
+    [output appendString:
+        @"MONITOR THREAD STACK\n"
+         "(reference only)\n"];
+
+
+    NSUInteger stackCount =
+        MIN(
+            monitorStack.count,
+            (NSUInteger)4
+        );
+
+
+    for (NSUInteger i = 0;
+         i < stackCount;
+         i++) {
+
+        [output appendFormat:
+            @"%@\n",
+
+            monitorStack[i]
+        ];
     }
 
 
     [output appendString:
-        @"\n"
-         "TARGET STATUS\n"
-         "Observation only\n"
-         "No priority changes\n"
-         "No suspension\n"
-         "No termination\n\n"];
-
-
-    [output appendString:
-        @"OTHER HOT THREADS\n"];
+        @"\nOTHER HOT THREADS\n"];
 
 
     NSUInteger otherCount =
-        MIN(count, (NSUInteger)5);
+        MIN(
+            count,
+            (NSUInteger)6
+        );
 
 
     for (NSUInteger i = 1;
@@ -798,6 +955,15 @@ static void BHFCollectStats(void)
     }
 
 
+    [output appendString:
+        @"\n"
+         "STATUS\n"
+         "Observation only\n"
+         "No priority changes\n"
+         "No suspension\n"
+         "No termination"];
+
+
     BHFUpdateOverlay(
         output
     );
@@ -812,7 +978,7 @@ static void BHFCollectStats(void)
 
         NSLog(
             @"[BumbleHeatFix] "
-             "Hot Thread Resolver v3.0 loaded"
+             "Stack Capture v3.1 loaded"
         );
 
 
