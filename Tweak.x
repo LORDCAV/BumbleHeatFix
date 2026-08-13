@@ -5,7 +5,6 @@
 #import <mach/mach.h>
 #import <mach/mach_init.h>
 #import <mach/thread_info.h>
-#import <mach/thread_policy.h>
 
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -241,7 +240,8 @@ static NSString *BHFImageNameForAddress(uintptr_t address,
             _dyld_get_image_vmaddr_slide(i);
 
         uintptr_t imageBase =
-            (uintptr_t)header + (uintptr_t)slide;
+            (uintptr_t)header +
+            (uintptr_t)slide;
 
         const char *name =
             _dyld_get_image_name(i);
@@ -250,10 +250,6 @@ static NSString *BHFImageNameForAddress(uintptr_t address,
             continue;
         }
 
-        /*
-         * Determine the mapped image's approximate
-         * upper boundary from its load commands.
-         */
         const uint8_t *commandPtr =
             (const uint8_t *)(header + 1);
 
@@ -334,7 +330,7 @@ static BOOL BHFIsYapDatabaseImage(NSString *imageName)
         != NSNotFound;
 }
 
-static NSString *BHFYapImageInfo(void)
+static uintptr_t BHFCurrentYapTarget(void)
 {
     uint32_t count =
         _dyld_image_count();
@@ -369,19 +365,10 @@ static NSString *BHFYapImageInfo(void)
             (uintptr_t)header +
             (uintptr_t)slide;
 
-        uintptr_t target =
-            base + 0xc7178;
-
-        return
-            [NSString stringWithFormat:
-                @"Yap base: 0x%llx\n"
-                 "Yap target: 0x%llx\n"
-                 "Target offset: +0xc7178",
-                 (unsigned long long)base,
-                 (unsigned long long)target];
+        return base + 0xc7178;
     }
 
-    return @"YapDatabase image: NOT FOUND";
+    return 0;
 }
 
 static void BHFStartNetworkMonitor(void)
@@ -531,17 +518,15 @@ static void BHFUpdateOverlay(void)
             BHFSameHotThreadSamples = 1;
         }
 
-        uintptr_t pc =
+        BHFLastPC =
             BHFGetThreadPC(hotThread);
-
-        BHFLastPC = pc;
 
         uintptr_t imageBase = 0;
         intptr_t imageOffset = 0;
 
         NSString *image =
             BHFImageNameForAddress(
-                pc,
+                BHFLastPC,
                 &imageBase,
                 &imageOffset
             );
@@ -572,76 +557,6 @@ static void BHFUpdateOverlay(void)
         status = @"NORMAL";
     }
 
-    NSString *pcText =
-        [NSString
-            stringWithFormat:
-                @"0x%llx",
-                (unsigned long long)BHFLastPC];
-
-    NSString *baseText =
-        [NSString
-            stringWithFormat:
-                @"0x%llx",
-                (unsigned long long)BHFLastImageBase];
-
-    NSString *offsetText =
-        [NSString
-            stringWithFormat:
-                @"+0x%llx",
-                (unsigned long long)BHFLastImageOffset];
-
-    uintptr_t currentTarget =
-        0;
-
-    uint32_t imageCount =
-        _dyld_image_count();
-
-    for (uint32_t i = 0;
-         i < imageCount;
-         i++) {
-
-        const char *name =
-            _dyld_get_image_name(i);
-
-        if (name == NULL) {
-            continue;
-        }
-
-        NSString *imageName =
-            [NSString stringWithUTF8String:name];
-
-        if (!BHFIsYapDatabaseImage(imageName)) {
-            continue;
-        }
-
-        const struct mach_header_64 *header =
-            BHFHeaderForImageIndex(i);
-
-        if (header != NULL) {
-
-            intptr_t slide =
-                _dyld_get_image_vmaddr_slide(i);
-
-            uintptr_t base =
-                (uintptr_t)header +
-                (uintptr_t)slide;
-
-            currentTarget =
-                base + 0xc7178;
-        }
-
-        break;
-    }
-
-    NSString *targetText =
-        currentTarget != 0
-        ?
-        [NSString stringWithFormat:
-            @"0x%llx",
-            (unsigned long long)currentTarget]
-        :
-        @"NOT FOUND";
-
     NSString *currentImage =
         @"unknown";
 
@@ -657,6 +572,18 @@ static void BHFUpdateOverlay(void)
                 &dummyOffset
             );
     }
+
+    uintptr_t yapTarget =
+        BHFCurrentYapTarget();
+
+    NSString *yapTargetText =
+        yapTarget != 0
+        ?
+        [NSString stringWithFormat:
+            @"0x%llx",
+            (unsigned long long)yapTarget]
+        :
+        @"NOT FOUND";
 
     NSString *text =
         [NSString stringWithFormat:
@@ -675,13 +602,13 @@ static void BHFUpdateOverlay(void)
              @"Same hot thread: %lu samples\n"
              @"\n"
              @"CURRENT PC\n"
-             @"%@\n"
+             @"0x%llx\n"
              @"CURRENT IMAGE\n"
              @"%@\n"
              @"IMAGE BASE\n"
-             @"%@\n"
+             @"0x%llx\n"
              @"IMAGE OFFSET\n"
-             @"%@\n"
+             @"+0x%llx\n"
              @"\n"
              @"YapDatabase target\n"
              @"%@\n"
@@ -704,11 +631,11 @@ static void BHFUpdateOverlay(void)
              foundHotThread ? hotThread : 0,
              foundHotThread ? hotThreadCPU : 0.0,
              (unsigned long)BHFSameHotThreadSamples,
-             pcText,
+             (unsigned long long)BHFLastPC,
              currentImage,
-             baseText,
-             offsetText,
-             targetText,
+             (unsigned long long)BHFLastImageBase,
+             (unsigned long long)BHFLastImageOffset,
+             yapTargetText,
              (unsigned long)BHFYapSamples,
              (unsigned long)BHFTotalSamples];
 
