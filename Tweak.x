@@ -1,8 +1,14 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <Network/Network.h>
+
 #import <mach/mach.h>
+#import <mach/mach_init.h>
 #import <mach/thread_info.h>
+#import <mach/thread_policy.h>
+
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 
 static UIWindow *BHFWindow = nil;
 static UILabel *BHFLabel = nil;
@@ -20,6 +26,12 @@ static NSUInteger BHFTotalSamples = 0;
 
 static thread_t BHFLastHotThread = MACH_PORT_NULL;
 static NSUInteger BHFSameHotThreadSamples = 0;
+
+static NSUInteger BHFYapSamples = 0;
+
+static uintptr_t BHFLastPC = 0;
+static uintptr_t BHFLastImageBase = 0;
+static intptr_t BHFLastImageOffset = 0;
 
 static NSString *BHFNetworkState(void)
 {
@@ -80,11 +92,11 @@ static double BHFCPUUsage(void)
             continue;
         }
 
-        double threadCPU =
+        double cpu =
             ((double)info.cpu_usage /
              (double)TH_USAGE_SCALE) * 100.0;
 
-        totalCPU += threadCPU;
+        totalCPU += cpu;
     }
 
     vm_deallocate(
@@ -96,8 +108,8 @@ static double BHFCPUUsage(void)
     return totalCPU;
 }
 
-static BOOL BHFFindHotThread(thread_t *hotThread,
-                             double *hotCPU)
+static BOOL BHFGetHotThread(thread_t *resultThread,
+                            double *resultCPU)
 {
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t threadCount = 0;
@@ -160,15 +172,216 @@ static BOOL BHFFindHotThread(thread_t *hotThread,
         return NO;
     }
 
-    if (hotThread != NULL) {
-        *hotThread = highestThread;
+    if (resultThread != NULL) {
+        *resultThread = highestThread;
     }
 
-    if (hotCPU != NULL) {
-        *hotCPU = highestCPU;
+    if (resultCPU != NULL) {
+        *resultCPU = highestCPU;
     }
 
     return YES;
+}
+
+static uintptr_t BHFGetThreadPC(thread_t thread)
+{
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count =
+        ARM_THREAD_STATE64_COUNT;
+
+    kern_return_t kr =
+        thread_get_state(
+            thread,
+            ARM_THREAD_STATE64,
+            (thread_state_t)&state,
+            &count
+        );
+
+    if (kr != KERN_SUCCESS) {
+        return 0;
+    }
+
+    return (uintptr_t)state.__pc;
+}
+
+static const struct mach_header_64 *
+BHFHeaderForImageIndex(uint32_t index)
+{
+    const struct mach_header *header =
+        _dyld_get_image_header(index);
+
+    if (header == NULL) {
+        return NULL;
+    }
+
+    if (header->magic != MH_MAGIC_64) {
+        return NULL;
+    }
+
+    return (const struct mach_header_64 *)header;
+}
+
+static NSString *BHFImageNameForAddress(uintptr_t address,
+                                         uintptr_t *base,
+                                         intptr_t *offset)
+{
+    uint32_t count =
+        _dyld_image_count();
+
+    for (uint32_t i = 0; i < count; i++) {
+
+        const struct mach_header_64 *header =
+            BHFHeaderForImageIndex(i);
+
+        if (header == NULL) {
+            continue;
+        }
+
+        intptr_t slide =
+            _dyld_get_image_vmaddr_slide(i);
+
+        uintptr_t imageBase =
+            (uintptr_t)header + (uintptr_t)slide;
+
+        const char *name =
+            _dyld_get_image_name(i);
+
+        if (name == NULL) {
+            continue;
+        }
+
+        /*
+         * Determine the mapped image's approximate
+         * upper boundary from its load commands.
+         */
+        const uint8_t *commandPtr =
+            (const uint8_t *)(header + 1);
+
+        uintptr_t imageEnd =
+            imageBase;
+
+        for (uint32_t commandIndex = 0;
+             commandIndex < header->ncmds;
+             commandIndex++) {
+
+            const struct load_command *command =
+                (const struct load_command *)commandPtr;
+
+            if (command->cmdsize <
+                sizeof(struct load_command)) {
+                break;
+            }
+
+            if (command->cmd == LC_SEGMENT_64) {
+
+                const struct segment_command_64 *segment =
+                    (const struct segment_command_64 *)command;
+
+                uintptr_t segmentStart =
+                    (uintptr_t)segment->vmaddr +
+                    (uintptr_t)slide;
+
+                uintptr_t segmentEnd =
+                    segmentStart +
+                    (uintptr_t)segment->vmsize;
+
+                if (segmentEnd > imageEnd) {
+                    imageEnd = segmentEnd;
+                }
+            }
+
+            commandPtr += command->cmdsize;
+        }
+
+        if (address >= imageBase &&
+            address < imageEnd) {
+
+            if (base != NULL) {
+                *base = imageBase;
+            }
+
+            if (offset != NULL) {
+                *offset =
+                    (intptr_t)(address - imageBase);
+            }
+
+            return [NSString
+                stringWithUTF8String:name];
+        }
+    }
+
+    if (base != NULL) {
+        *base = 0;
+    }
+
+    if (offset != NULL) {
+        *offset = 0;
+    }
+
+    return @"unknown";
+}
+
+static BOOL BHFIsYapDatabaseImage(NSString *imageName)
+{
+    if (imageName == nil) {
+        return NO;
+    }
+
+    return
+        [imageName rangeOfString:
+            @"YapDatabase.framework/YapDatabase"
+            options:NSCaseInsensitiveSearch].location
+        != NSNotFound;
+}
+
+static NSString *BHFYapImageInfo(void)
+{
+    uint32_t count =
+        _dyld_image_count();
+
+    for (uint32_t i = 0; i < count; i++) {
+
+        const char *name =
+            _dyld_get_image_name(i);
+
+        if (name == NULL) {
+            continue;
+        }
+
+        NSString *imageName =
+            [NSString stringWithUTF8String:name];
+
+        if (!BHFIsYapDatabaseImage(imageName)) {
+            continue;
+        }
+
+        const struct mach_header_64 *header =
+            BHFHeaderForImageIndex(i);
+
+        if (header == NULL) {
+            continue;
+        }
+
+        intptr_t slide =
+            _dyld_get_image_vmaddr_slide(i);
+
+        uintptr_t base =
+            (uintptr_t)header +
+            (uintptr_t)slide;
+
+        uintptr_t target =
+            base + 0xc7178;
+
+        return
+            [NSString stringWithFormat:
+                @"Yap base: 0x%llx\n"
+                 "Yap target: 0x%llx\n"
+                 "Target offset: +0xc7178",
+                 (unsigned long long)base,
+                 (unsigned long long)target];
+    }
+
+    return @"YapDatabase image: NOT FOUND";
 }
 
 static void BHFStartNetworkMonitor(void)
@@ -225,17 +438,17 @@ static void BHFCreateOverlay(void)
         return;
     }
 
-    CGRect bounds =
+    CGRect screen =
         [UIScreen mainScreen].bounds;
 
     BHFWindow =
         [[UIWindow alloc]
             initWithFrame:
             CGRectMake(
-                10.0,
-                45.0,
-                bounds.size.width - 20.0,
-                255.0
+                8.0,
+                40.0,
+                screen.size.width - 16.0,
+                360.0
             )];
 
     BHFWindow.windowLevel =
@@ -243,7 +456,7 @@ static void BHFCreateOverlay(void)
 
     BHFWindow.backgroundColor =
         [UIColor colorWithWhite:0.0
-                          alpha:0.90];
+                          alpha:0.92];
 
     BHFWindow.layer.cornerRadius =
         14.0;
@@ -256,19 +469,16 @@ static void BHFCreateOverlay(void)
             CGRectMake(
                 12.0,
                 10.0,
-                bounds.size.width - 44.0,
-                235.0
+                screen.size.width - 40.0,
+                340.0
             )];
 
     BHFLabel.textColor =
         [UIColor whiteColor];
 
-    BHFLabel.backgroundColor =
-        [UIColor clearColor];
-
     BHFLabel.font =
         [UIFont monospacedSystemFontOfSize:
-            13.0
+            12.5
             weight:UIFontWeightRegular];
 
     BHFLabel.numberOfLines = 0;
@@ -293,8 +503,8 @@ static void BHFUpdateOverlay(void)
 
     double hotThreadCPU = 0.0;
 
-    BOOL haveHotThread =
-        BHFFindHotThread(
+    BOOL foundHotThread =
+        BHFGetHotThread(
             &hotThread,
             &hotThreadCPU
         );
@@ -309,7 +519,7 @@ static void BHFUpdateOverlay(void)
         BHFPeakCPU = cpu;
     }
 
-    if (haveHotThread) {
+    if (foundHotThread) {
 
         if (hotThread == BHFLastHotThread) {
             BHFSameHotThreadSamples++;
@@ -319,6 +529,31 @@ static void BHFUpdateOverlay(void)
                 hotThread;
 
             BHFSameHotThreadSamples = 1;
+        }
+
+        uintptr_t pc =
+            BHFGetThreadPC(hotThread);
+
+        BHFLastPC = pc;
+
+        uintptr_t imageBase = 0;
+        intptr_t imageOffset = 0;
+
+        NSString *image =
+            BHFImageNameForAddress(
+                pc,
+                &imageBase,
+                &imageOffset
+            );
+
+        BHFLastImageBase =
+            imageBase;
+
+        BHFLastImageOffset =
+            imageOffset;
+
+        if (BHFIsYapDatabaseImage(image)) {
+            BHFYapSamples++;
         }
     }
 
@@ -337,30 +572,96 @@ static void BHFUpdateOverlay(void)
         status = @"NORMAL";
     }
 
-    NSString *hotThreadText;
+    NSString *pcText =
+        [NSString
+            stringWithFormat:
+                @"0x%llx",
+                (unsigned long long)BHFLastPC];
 
-    if (haveHotThread) {
-        hotThreadText =
-            [NSString stringWithFormat:
-                @"Hot thread: %u\n"
-                 @"Hot thread CPU: %.1f%%\n"
-                 @"Same hot thread samples: %lu",
-                 hotThread,
-                 hotThreadCPU,
-                 (unsigned long)
-                    BHFSameHotThreadSamples];
+    NSString *baseText =
+        [NSString
+            stringWithFormat:
+                @"0x%llx",
+                (unsigned long long)BHFLastImageBase];
+
+    NSString *offsetText =
+        [NSString
+            stringWithFormat:
+                @"+0x%llx",
+                (unsigned long long)BHFLastImageOffset];
+
+    uintptr_t currentTarget =
+        0;
+
+    uint32_t imageCount =
+        _dyld_image_count();
+
+    for (uint32_t i = 0;
+         i < imageCount;
+         i++) {
+
+        const char *name =
+            _dyld_get_image_name(i);
+
+        if (name == NULL) {
+            continue;
+        }
+
+        NSString *imageName =
+            [NSString stringWithUTF8String:name];
+
+        if (!BHFIsYapDatabaseImage(imageName)) {
+            continue;
+        }
+
+        const struct mach_header_64 *header =
+            BHFHeaderForImageIndex(i);
+
+        if (header != NULL) {
+
+            intptr_t slide =
+                _dyld_get_image_vmaddr_slide(i);
+
+            uintptr_t base =
+                (uintptr_t)header +
+                (uintptr_t)slide;
+
+            currentTarget =
+                base + 0xc7178;
+        }
+
+        break;
     }
-    else {
-        hotThreadText =
-            @"Hot thread: unavailable\n"
-             "Hot thread CPU: unavailable\n"
-             "Same hot thread samples: 0";
+
+    NSString *targetText =
+        currentTarget != 0
+        ?
+        [NSString stringWithFormat:
+            @"0x%llx",
+            (unsigned long long)currentTarget]
+        :
+        @"NOT FOUND";
+
+    NSString *currentImage =
+        @"unknown";
+
+    if (BHFLastPC != 0) {
+
+        uintptr_t dummyBase = 0;
+        intptr_t dummyOffset = 0;
+
+        currentImage =
+            BHFImageNameForAddress(
+                BHFLastPC,
+                &dummyBase,
+                &dummyOffset
+            );
     }
 
     NSString *text =
         [NSString stringWithFormat:
             @"BumbleHeatFix\n"
-             @"CPU CORRELATION v3.8\n"
+             @"YAP PATH SAMPLER v3.9\n"
              @"\n"
              @"CPU: %.1f%%\n"
              @"Peak CPU: %.1f%%\n"
@@ -368,26 +669,53 @@ static void BHFUpdateOverlay(void)
              @"Network: %@\n"
              @"Status: %@\n"
              @"\n"
+             @"HOT THREAD\n"
+             @"TID: %u\n"
+             @"CPU: %.1f%%\n"
+             @"Same hot thread: %lu samples\n"
+             @"\n"
+             @"CURRENT PC\n"
+             @"%@\n"
+             @"CURRENT IMAGE\n"
+             @"%@\n"
+             @"IMAGE BASE\n"
+             @"%@\n"
+             @"IMAGE OFFSET\n"
              @"%@\n"
              @"\n"
-             @"YapDatabase reference:\n"
-             @"+0xc7178\n"
+             @"YapDatabase target\n"
+             @"%@\n"
              @"\n"
-             @"OBSERVATION ONLY\n"
-             @"No hook / no patch\n"
-             @"No database modification",
+             @"Yap path samples: %lu / %lu\n"
+             @"\n"
+             @"TARGET STATUS\n"
+             @"Read-only observation\n"
+             @"No hook\n"
+             @"No patch\n"
+             @"No priority changes\n"
+             @"No suspension\n"
+             @"No termination",
              cpu,
              BHFPeakCPU,
              (unsigned long)BHFHotSamples,
              (unsigned long)BHFTotalSamples,
              network,
              status,
-             hotThreadText];
+             foundHotThread ? hotThread : 0,
+             foundHotThread ? hotThreadCPU : 0.0,
+             (unsigned long)BHFSameHotThreadSamples,
+             pcText,
+             currentImage,
+             baseText,
+             offsetText,
+             targetText,
+             (unsigned long)BHFYapSamples,
+             (unsigned long)BHFTotalSamples];
 
     dispatch_async(
         dispatch_get_main_queue(),
         ^{
-            if (BHFLabel == nil) {
+            if (BHFWindow == nil) {
                 BHFCreateOverlay();
             }
 
