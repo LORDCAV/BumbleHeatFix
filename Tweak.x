@@ -2,32 +2,55 @@
 #import <Foundation/Foundation.h>
 #import <Network/Network.h>
 #import <mach/mach.h>
+#import <mach/thread_info.h>
 
-static UIWindow *BHFOverlayWindow = nil;
-static UILabel *BHFOverlayLabel = nil;
+static UIWindow *BHFWindow = nil;
+static UILabel *BHFLabel = nil;
+static NSTimer *BHFTimer = nil;
 
 static nw_path_monitor_t BHFNetworkMonitor = NULL;
 
-static BOOL BHFNetworkAvailable = NO;
+static BOOL BHFNetworkOnline = NO;
 static BOOL BHFNetworkExpensive = NO;
 static BOOL BHFNetworkConstrained = NO;
 
 static double BHFPeakCPU = 0.0;
 static NSUInteger BHFHotSamples = 0;
+static NSUInteger BHFTotalSamples = 0;
 
-static double BHFGetCPUUsage(void)
+static thread_t BHFLastHotThread = MACH_PORT_NULL;
+static NSUInteger BHFSameHotThreadSamples = 0;
+
+static NSString *BHFNetworkState(void)
+{
+    if (!BHFNetworkOnline) {
+        return @"OFFLINE";
+    }
+
+    if (BHFNetworkConstrained) {
+        return @"CONSTRAINED";
+    }
+
+    if (BHFNetworkExpensive) {
+        return @"EXPENSIVE";
+    }
+
+    return @"ONLINE";
+}
+
+static double BHFCPUUsage(void)
 {
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t threadCount = 0;
 
-    kern_return_t result =
+    kern_return_t kr =
         task_threads(
             mach_task_self(),
             &threads,
             &threadCount
         );
 
-    if (result != KERN_SUCCESS || threads == NULL) {
+    if (kr != KERN_SUCCESS || threads == NULL) {
         return 0.0;
     }
 
@@ -41,7 +64,7 @@ static double BHFGetCPUUsage(void)
         mach_msg_type_number_t count =
             THREAD_BASIC_INFO_COUNT;
 
-        kern_return_t threadResult =
+        kr =
             thread_info(
                 threads[i],
                 THREAD_BASIC_INFO,
@@ -49,7 +72,7 @@ static double BHFGetCPUUsage(void)
                 &count
             );
 
-        if (threadResult != KERN_SUCCESS) {
+        if (kr != KERN_SUCCESS) {
             continue;
         }
 
@@ -57,9 +80,11 @@ static double BHFGetCPUUsage(void)
             continue;
         }
 
-        totalCPU +=
+        double threadCPU =
             ((double)info.cpu_usage /
              (double)TH_USAGE_SCALE) * 100.0;
+
+        totalCPU += threadCPU;
     }
 
     vm_deallocate(
@@ -71,21 +96,79 @@ static double BHFGetCPUUsage(void)
     return totalCPU;
 }
 
-static NSString *BHFNetworkState(void)
+static BOOL BHFFindHotThread(thread_t *hotThread,
+                             double *hotCPU)
 {
-    if (!BHFNetworkAvailable) {
-        return @"OFFLINE";
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t threadCount = 0;
+
+    kern_return_t kr =
+        task_threads(
+            mach_task_self(),
+            &threads,
+            &threadCount
+        );
+
+    if (kr != KERN_SUCCESS || threads == NULL) {
+        return NO;
     }
 
-    if (BHFNetworkConstrained) {
-        return @"CONSTRAINED";
+    double highestCPU = 0.0;
+    thread_t highestThread = MACH_PORT_NULL;
+
+    for (mach_msg_type_number_t i = 0;
+         i < threadCount;
+         i++) {
+
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count =
+            THREAD_BASIC_INFO_COUNT;
+
+        kr =
+            thread_info(
+                threads[i],
+                THREAD_BASIC_INFO,
+                (thread_info_t)&info,
+                &count
+            );
+
+        if (kr != KERN_SUCCESS) {
+            continue;
+        }
+
+        if (info.flags & TH_FLAGS_IDLE) {
+            continue;
+        }
+
+        double cpu =
+            ((double)info.cpu_usage /
+             (double)TH_USAGE_SCALE) * 100.0;
+
+        if (cpu > highestCPU) {
+            highestCPU = cpu;
+            highestThread = threads[i];
+        }
     }
 
-    if (BHFNetworkExpensive) {
-        return @"EXPENSIVE";
+    vm_deallocate(
+        mach_task_self(),
+        (vm_address_t)threads,
+        (vm_size_t)(threadCount * sizeof(thread_t))
+    );
+
+    if (highestThread == MACH_PORT_NULL) {
+        return NO;
     }
 
-    return @"ONLINE";
+    if (hotThread != NULL) {
+        *hotThread = highestThread;
+    }
+
+    if (hotCPU != NULL) {
+        *hotCPU = highestCPU;
+    }
+
+    return YES;
 }
 
 static void BHFStartNetworkMonitor(void)
@@ -115,7 +198,7 @@ static void BHFStartNetworkMonitor(void)
             nw_path_status_t status =
                 nw_path_get_status(path);
 
-            BHFNetworkAvailable =
+            BHFNetworkOnline =
                 (status == nw_path_status_satisfied);
 
             BHFNetworkExpensive =
@@ -124,7 +207,8 @@ static void BHFStartNetworkMonitor(void)
             if (@available(iOS 13.0, *)) {
                 BHFNetworkConstrained =
                     nw_path_is_constrained(path);
-            } else {
+            }
+            else {
                 BHFNetworkConstrained = NO;
             }
         }
@@ -137,87 +221,105 @@ static void BHFStartNetworkMonitor(void)
 
 static void BHFCreateOverlay(void)
 {
-    dispatch_async(
-        dispatch_get_main_queue(),
-        ^{
+    if (BHFWindow != nil) {
+        return;
+    }
 
-            if (BHFOverlayWindow != nil) {
-                return;
-            }
+    CGRect bounds =
+        [UIScreen mainScreen].bounds;
 
-            CGRect screenBounds =
-                [UIScreen mainScreen].bounds;
+    BHFWindow =
+        [[UIWindow alloc]
+            initWithFrame:
+            CGRectMake(
+                10.0,
+                45.0,
+                bounds.size.width - 20.0,
+                255.0
+            )];
 
-            BHFOverlayWindow =
-                [[UIWindow alloc]
-                    initWithFrame:
-                    CGRectMake(
-                        10.0,
-                        50.0,
-                        screenBounds.size.width - 20.0,
-                        190.0
-                    )];
+    BHFWindow.windowLevel =
+        UIWindowLevelAlert + 100.0;
 
-            BHFOverlayWindow.windowLevel =
-                UIWindowLevelAlert + 100.0;
+    BHFWindow.backgroundColor =
+        [UIColor colorWithWhite:0.0
+                          alpha:0.90];
 
-            BHFOverlayWindow.backgroundColor =
-                [UIColor colorWithWhite:0.0
-                                  alpha:0.88];
+    BHFWindow.layer.cornerRadius =
+        14.0;
 
-            BHFOverlayWindow.layer.cornerRadius =
-                12.0;
+    BHFWindow.clipsToBounds = YES;
 
-            BHFOverlayWindow.clipsToBounds = YES;
+    BHFLabel =
+        [[UILabel alloc]
+            initWithFrame:
+            CGRectMake(
+                12.0,
+                10.0,
+                bounds.size.width - 44.0,
+                235.0
+            )];
 
-            BHFOverlayLabel =
-                [[UILabel alloc]
-                    initWithFrame:
-                    CGRectMake(
-                        12.0,
-                        10.0,
-                        screenBounds.size.width - 44.0,
-                        170.0
-                    )];
+    BHFLabel.textColor =
+        [UIColor whiteColor];
 
-            BHFOverlayLabel.textColor =
-                [UIColor whiteColor];
+    BHFLabel.backgroundColor =
+        [UIColor clearColor];
 
-            BHFOverlayLabel.backgroundColor =
-                [UIColor clearColor];
+    BHFLabel.font =
+        [UIFont monospacedSystemFontOfSize:
+            13.0
+            weight:UIFontWeightRegular];
 
-            BHFOverlayLabel.font =
-                [UIFont monospacedSystemFontOfSize:
-                    13.0
-                    weight:UIFontWeightRegular];
+    BHFLabel.numberOfLines = 0;
 
-            BHFOverlayLabel.numberOfLines = 0;
+    BHFLabel.textAlignment =
+        NSTextAlignmentLeft;
 
-            BHFOverlayLabel.textAlignment =
-                NSTextAlignmentLeft;
+    [BHFWindow addSubview:BHFLabel];
 
-            [BHFOverlayWindow
-                addSubview:BHFOverlayLabel];
+    BHFWindow.hidden = NO;
 
-            BHFOverlayWindow.hidden = NO;
-
-            [BHFOverlayWindow
-                makeKeyAndVisible];
-        }
-    );
+    [BHFWindow makeKeyAndVisible];
 }
 
 static void BHFUpdateOverlay(void)
 {
     double cpu =
-        BHFGetCPUUsage();
+        BHFCPUUsage();
+
+    thread_t hotThread =
+        MACH_PORT_NULL;
+
+    double hotThreadCPU = 0.0;
+
+    BOOL haveHotThread =
+        BHFFindHotThread(
+            &hotThread,
+            &hotThreadCPU
+        );
+
+    BHFTotalSamples++;
+
+    if (cpu >= 80.0) {
+        BHFHotSamples++;
+    }
 
     if (cpu > BHFPeakCPU) {
         BHFPeakCPU = cpu;
     }
 
-    if (cpu >= 80.0) {
-        BHFHotSamples++;
+    if (haveHotThread) {
+
+        if (hotThread == BHFLastHotThread) {
+            BHFSameHotThreadSamples++;
+        }
+        else {
+            BHFLastHotThread =
+                hotThread;
+
+            BHFSameHotThreadSamples = 1;
+        }
     }
 
     NSString *network =
@@ -235,40 +337,65 @@ static void BHFUpdateOverlay(void)
         status = @"NORMAL";
     }
 
+    NSString *hotThreadText;
+
+    if (haveHotThread) {
+        hotThreadText =
+            [NSString stringWithFormat:
+                @"Hot thread: %lu\n"
+                 @"Hot thread CPU: %.1f%%\n"
+                 @"Same hot thread samples: %lu",
+                 (unsigned long)hotThread,
+                 hotThreadCPU,
+                 (unsigned long)BHFSameHotThreadSamples];
+    }
+    else {
+        hotThreadText =
+            @"Hot thread: unavailable\n"
+             @"Hot thread CPU: unavailable\n"
+             @"Same hot thread samples: 0";
+    }
+
     NSString *text =
         [NSString stringWithFormat:
             @"BumbleHeatFix\n"
-             @"NETWORK OBSERVER v3.7\n"
+             @"CPU CORRELATION v3.8\n"
              @"\n"
              @"CPU: %.1f%%\n"
              @"Peak CPU: %.1f%%\n"
-             @"Hot samples: %lu\n"
+             @"Hot samples: %lu / %lu\n"
              @"Network: %@\n"
              @"Status: %@\n"
              @"\n"
+             @"%@\n"
+             @"\n"
+             @"YapDatabase reference:\n"
+             @"+0xc7178\n"
+             @"\n"
              @"OBSERVATION ONLY\n"
-             @"No network blocking\n"
-             @"No thread changes\n"
-             @"No suspension / termination",
+             @"No hook / no patch\n"
+             @"No database modification",
              cpu,
              BHFPeakCPU,
              (unsigned long)BHFHotSamples,
+             (unsigned long)BHFTotalSamples,
              network,
-             status];
+             status,
+             hotThreadText];
 
     dispatch_async(
         dispatch_get_main_queue(),
         ^{
-            if (BHFOverlayLabel == nil) {
+            if (BHFLabel == nil) {
                 BHFCreateOverlay();
             }
 
-            BHFOverlayLabel.text = text;
+            BHFLabel.text = text;
         }
     );
 }
 
-static void BHFStartTimer(void)
+static void BHFStartMonitoring(void)
 {
     dispatch_async(
         dispatch_get_main_queue(),
@@ -276,11 +403,12 @@ static void BHFStartTimer(void)
 
             BHFCreateOverlay();
 
-            [NSTimer
-                scheduledTimerWithTimeInterval:
-                    5.0
-                    repeats:YES
-                    block:^(NSTimer *timer) {
+            BHFTimer =
+                [NSTimer
+                    scheduledTimerWithTimeInterval:
+                        5.0
+                        repeats:YES
+                        block:^(NSTimer *timer) {
 
                 BHFUpdateOverlay();
             }];
@@ -297,6 +425,6 @@ static void BumbleHeatFixInit(void)
 
         BHFStartNetworkMonitor();
 
-        BHFStartTimer();
+        BHFStartMonitoring();
     }
 }
