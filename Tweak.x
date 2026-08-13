@@ -4,32 +4,23 @@
 
 #import <mach/mach.h>
 #import <mach/mach_init.h>
-#import <mach/mach_vm.h>
 #import <mach/thread_info.h>
 #import <mach/arm/thread_status.h>
 
 #import <dlfcn.h>
 
-#pragma mark - Configuration
-
 #define BHF_MAX_STACK_FRAMES 8
 #define BHF_SAMPLE_INTERVAL 5.0
-
-#pragma mark - UI
 
 static UIWindow *BHFWindow = nil;
 static UILabel *BHFLabel = nil;
 static NSTimer *BHFTimer = nil;
-
-#pragma mark - Network
 
 static nw_path_monitor_t BHFNetworkMonitor = NULL;
 
 static BOOL BHFNetworkOnline = NO;
 static BOOL BHFNetworkExpensive = NO;
 static BOOL BHFNetworkConstrained = NO;
-
-#pragma mark - CPU
 
 static double BHFPeakCPU = 0.0;
 
@@ -39,31 +30,25 @@ static NSUInteger BHFTotalSamples = 0;
 static thread_t BHFLastHotThread = MACH_PORT_NULL;
 static NSUInteger BHFSameThreadSamples = 0;
 
-#pragma mark - Current hot thread
-
 static uintptr_t BHFCurrentPC = 0;
 static uintptr_t BHFCurrentSP = 0;
 static uintptr_t BHFCurrentFP = 0;
 
 static double BHFCurrentThreadCPU = 0.0;
 
-#pragma mark - Current PC resolver
-
-static NSString *BHFCurrentImage = @"unknown";
-static NSString *BHFCurrentSymbol = @"unknown";
+static char BHFCurrentImage[512];
+static char BHFCurrentSymbol[256];
 
 static uintptr_t BHFCurrentImageBase = 0;
 static uintptr_t BHFCurrentImageOffset = 0;
-
-#pragma mark - Stack
 
 static NSUInteger BHFStackCount = 0;
 
 static uintptr_t BHFStackAddresses[BHF_MAX_STACK_FRAMES];
 static uintptr_t BHFStackOffsets[BHF_MAX_STACK_FRAMES];
 
-static NSString *BHFStackImages[BHF_MAX_STACK_FRAMES];
-static NSString *BHFStackSymbols[BHF_MAX_STACK_FRAMES];
+static char BHFStackImages[BHF_MAX_STACK_FRAMES][512];
+static char BHFStackSymbols[BHF_MAX_STACK_FRAMES][256];
 
 #pragma mark - Source counters
 
@@ -76,7 +61,7 @@ static NSUInteger BHFSwiftSamples = 0;
 static NSUInteger BHFSystemSamples = 0;
 static NSUInteger BHFOtherSamples = 0;
 
-#pragma mark - Network state
+#pragma mark - Network
 
 static NSString *BHFNetworkState(void)
 {
@@ -97,7 +82,8 @@ static NSString *BHFNetworkState(void)
 
 static void BHFStartNetworkMonitor(void)
 {
-    BHFNetworkMonitor = nw_path_monitor_create();
+    BHFNetworkMonitor =
+        nw_path_monitor_create();
 
     if (BHFNetworkMonitor == NULL) {
         return;
@@ -122,16 +108,19 @@ static void BHFStartNetworkMonitor(void)
                 nw_path_get_status(path);
 
             BHFNetworkOnline =
-                (status == nw_path_status_satisfied);
+                (status ==
+                 nw_path_status_satisfied);
 
             BHFNetworkExpensive =
                 nw_path_is_expensive(path);
 
             if (@available(iOS 13.0, *)) {
+
                 BHFNetworkConstrained =
                     nw_path_is_constrained(path);
-            }
-            else {
+
+            } else {
+
                 BHFNetworkConstrained = NO;
             }
         }
@@ -156,7 +145,9 @@ static double BHFCPUUsage(void)
             &threadCount
         );
 
-    if (kr != KERN_SUCCESS || threads == NULL) {
+    if (kr != KERN_SUCCESS ||
+        threads == NULL) {
+
         return 0.0;
     }
 
@@ -189,7 +180,8 @@ static double BHFCPUUsage(void)
 
         double cpu =
             ((double)info.cpu_usage /
-             (double)TH_USAGE_SCALE) * 100.0;
+             (double)TH_USAGE_SCALE) *
+            100.0;
 
         totalCPU += cpu;
     }
@@ -198,7 +190,8 @@ static double BHFCPUUsage(void)
         mach_task_self(),
         (vm_address_t)threads,
         (vm_size_t)(
-            threadCount * sizeof(thread_t)
+            threadCount *
+            sizeof(thread_t)
         )
     );
 
@@ -220,12 +213,15 @@ static BOOL BHFGetHotThread(
             &threadCount
         );
 
-    if (kr != KERN_SUCCESS || threads == NULL) {
+    if (kr != KERN_SUCCESS ||
+        threads == NULL) {
+
         return NO;
     }
 
     double highestCPU = 0.0;
-    thread_t highestThread = MACH_PORT_NULL;
+    thread_t highestThread =
+        MACH_PORT_NULL;
 
     for (mach_msg_type_number_t i = 0;
          i < threadCount;
@@ -254,9 +250,11 @@ static BOOL BHFGetHotThread(
 
         double cpu =
             ((double)info.cpu_usage /
-             (double)TH_USAGE_SCALE) * 100.0;
+             (double)TH_USAGE_SCALE) *
+            100.0;
 
         if (cpu > highestCPU) {
+
             highestCPU = cpu;
             highestThread = threads[i];
         }
@@ -266,20 +264,25 @@ static BOOL BHFGetHotThread(
         mach_task_self(),
         (vm_address_t)threads,
         (vm_size_t)(
-            threadCount * sizeof(thread_t)
+            threadCount *
+            sizeof(thread_t)
         )
     );
 
-    if (highestThread == MACH_PORT_NULL) {
+    if (highestThread ==
+        MACH_PORT_NULL) {
+
         return NO;
     }
 
     if (resultThread != NULL) {
-        *resultThread = highestThread;
+        *resultThread =
+            highestThread;
     }
 
     if (resultCPU != NULL) {
-        *resultCPU = highestCPU;
+        *resultCPU =
+            highestCPU;
     }
 
     return YES;
@@ -289,18 +292,24 @@ static BOOL BHFGetHotThread(
 
 static void BHFResolveAddress(
     uintptr_t address,
-    NSString **image,
-    NSString **symbol,
+    char *image,
+    size_t imageSize,
+    char *symbol,
+    size_t symbolSize,
     uintptr_t *base,
     uintptr_t *offset
 )
 {
-    if (image != NULL) {
-        *image = @"unknown";
+    if (image != NULL &&
+        imageSize > 0) {
+
+        image[0] = '\0';
     }
 
-    if (symbol != NULL) {
-        *symbol = @"unknown";
+    if (symbol != NULL &&
+        symbolSize > 0) {
+
+        symbol[0] = '\0';
     }
 
     if (base != NULL) {
@@ -336,32 +345,33 @@ static void BHFResolveAddress(
     uintptr_t imageBase = 0;
 
     if (info.dli_fbase != NULL) {
+
         imageBase =
             (uintptr_t)info.dli_fbase;
     }
 
     if (image != NULL &&
+        imageSize > 0 &&
         info.dli_fname != NULL) {
 
-        *image =
-            [NSString stringWithUTF8String:
-                info.dli_fname];
-
-        if (*image == nil) {
-            *image = @"unknown";
-        }
+        snprintf(
+            image,
+            imageSize,
+            "%s",
+            info.dli_fname
+        );
     }
 
     if (symbol != NULL &&
+        symbolSize > 0 &&
         info.dli_sname != NULL) {
 
-        *symbol =
-            [NSString stringWithUTF8String:
-                info.dli_sname];
-
-        if (*symbol == nil) {
-            *symbol = @"unknown";
-        }
+        snprintf(
+            symbol,
+            symbolSize,
+            "%s",
+            info.dli_sname
+        );
     }
 
     if (base != NULL) {
@@ -377,19 +387,29 @@ static void BHFResolveAddress(
     }
 }
 
-#pragma mark - Source classification
+#pragma mark - Classification
 
 static void BHFClassifyImage(
-    NSString *image
+    const char *image
 )
 {
-    if (image == nil) {
+    if (image == NULL ||
+        image[0] == '\0') {
+
+        BHFOtherSamples++;
+        return;
+    }
+
+    NSString *path =
+        [NSString stringWithUTF8String:image];
+
+    if (path == nil) {
         BHFOtherSamples++;
         return;
     }
 
     NSString *lower =
-        [image lowercaseString];
+        [path lowercaseString];
 
     if ([lower containsString:@"yapdatabase"]) {
 
@@ -449,12 +469,12 @@ static void BHFResetStack(void)
         BHFStackAddresses[i] = 0;
         BHFStackOffsets[i] = 0;
 
-        BHFStackImages[i] = @"unknown";
-        BHFStackSymbols[i] = @"unknown";
+        BHFStackImages[i][0] = '\0';
+        BHFStackSymbols[i][0] = '\0';
     }
 }
 
-#pragma mark - Read another thread's frame
+#pragma mark - Read frame
 
 static BOOL BHFReadFrame(
     uintptr_t address,
@@ -466,14 +486,10 @@ static BOOL BHFReadFrame(
         return NO;
     }
 
-    /*
-     ARM64 frame records are normally:
-
-     [FP + 0]  = previous frame pointer
-     [FP + 8]  = saved link register / return address
-    */
-
-    uint64_t frame[2] = {0, 0};
+    uint64_t frame[2] = {
+        0,
+        0
+    };
 
     vm_size_t dataSize =
         sizeof(frame);
@@ -491,16 +507,20 @@ static BOOL BHFReadFrame(
         return NO;
     }
 
-    if (dataSize < sizeof(frame)) {
+    if (dataSize <
+        sizeof(frame)) {
+
         return NO;
     }
 
     if (previousFP != NULL) {
+
         *previousFP =
             (uintptr_t)frame[0];
     }
 
     if (returnAddress != NULL) {
+
         *returnAddress =
             (uintptr_t)frame[1];
     }
@@ -508,7 +528,7 @@ static BOOL BHFReadFrame(
     return YES;
 }
 
-#pragma mark - ARM64 frame walk
+#pragma mark - ARM64 stack walk
 
 static void BHFCollectStack(
     thread_t thread
@@ -542,10 +562,18 @@ static void BHFCollectStack(
     BHFCurrentFP =
         (uintptr_t)state.__fp;
 
+    BHFCurrentImage[0] = '\0';
+    BHFCurrentSymbol[0] = '\0';
+
+    BHFCurrentImageBase = 0;
+    BHFCurrentImageOffset = 0;
+
     BHFResolveAddress(
         BHFCurrentPC,
-        &BHFCurrentImage,
-        &BHFCurrentSymbol,
+        BHFCurrentImage,
+        sizeof(BHFCurrentImage),
+        BHFCurrentSymbol,
+        sizeof(BHFCurrentSymbol),
         &BHFCurrentImageBase,
         &BHFCurrentImageOffset
     );
@@ -554,36 +582,30 @@ static void BHFCollectStack(
         BHFCurrentImage
     );
 
-    /*
-     Frame #0 is the current PC.
-    */
-
     BHFStackAddresses[0] =
         BHFCurrentPC;
-
-    BHFStackImages[0] =
-        BHFCurrentImage;
-
-    BHFStackSymbols[0] =
-        BHFCurrentSymbol;
 
     BHFStackOffsets[0] =
         BHFCurrentImageOffset;
 
+    snprintf(
+        BHFStackImages[0],
+        sizeof(BHFStackImages[0]),
+        "%s",
+        BHFCurrentImage
+    );
+
+    snprintf(
+        BHFStackSymbols[0],
+        sizeof(BHFStackSymbols[0]),
+        "%s",
+        BHFCurrentSymbol
+    );
+
     BHFStackCount = 1;
-
-    /*
-     Walk saved frame pointers.
-
-     We deliberately limit this to a small number
-     of frames and perform read-only memory access.
-    */
 
     uintptr_t fp =
         BHFCurrentFP;
-
-    uintptr_t previousFP = 0;
-    uintptr_t returnAddress = 0;
 
     for (NSUInteger i = 1;
          i < BHF_MAX_STACK_FRAMES;
@@ -593,13 +615,12 @@ static void BHFCollectStack(
             break;
         }
 
-        /*
-         Basic ARM64 alignment check.
-        */
-
         if ((fp & 0x7) != 0) {
             break;
         }
+
+        uintptr_t previousFP = 0;
+        uintptr_t returnAddress = 0;
 
         if (!BHFReadFrame(
                 fp,
@@ -614,36 +635,39 @@ static void BHFCollectStack(
             break;
         }
 
-        /*
-         Prevent obvious loops.
-        */
-
         if (previousFP == fp) {
             break;
         }
 
-        if (previousFP < fp &&
-            (fp - previousFP) > (1024 * 1024)) {
-
-            break;
-        }
-
         if (previousFP > fp &&
-            (previousFP - fp) > (1024 * 1024)) {
+            previousFP - fp >
+                (1024 * 1024)) {
 
             break;
         }
 
-        NSString *image = @"unknown";
-        NSString *symbol = @"unknown";
+        if (fp > previousFP &&
+            fp - previousFP >
+                (1024 * 1024)) {
+
+            break;
+        }
+
+        char image[512];
+        char symbol[256];
+
+        image[0] = '\0';
+        symbol[0] = '\0';
 
         uintptr_t base = 0;
         uintptr_t offset = 0;
 
         BHFResolveAddress(
             returnAddress,
-            &image,
-            &symbol,
+            image,
+            sizeof(image),
+            symbol,
+            sizeof(symbol),
             &base,
             &offset
         );
@@ -651,20 +675,24 @@ static void BHFCollectStack(
         BHFStackAddresses[i] =
             returnAddress;
 
-        BHFStackImages[i] =
-            image;
-
-        BHFStackSymbols[i] =
-            symbol;
-
         BHFStackOffsets[i] =
             offset;
 
-        BHFStackCount++;
+        snprintf(
+            BHFStackImages[i],
+            sizeof(BHFStackImages[i]),
+            "%s",
+            image
+        );
 
-        /*
-         Continue through the previous frame.
-        */
+        snprintf(
+            BHFStackSymbols[i],
+            sizeof(BHFStackSymbols[i]),
+            "%s",
+            symbol
+        );
+
+        BHFStackCount++;
 
         fp = previousFP;
     }
@@ -691,7 +719,7 @@ static void BHFCreateOverlay(void)
                     8.0,
                     35.0,
                     width,
-                    560.0
+                    570.0
                 )];
 
     BHFWindow.windowLevel =
@@ -722,7 +750,7 @@ static void BHFCreateOverlay(void)
                     12.0,
                     10.0,
                     width - 24.0,
-                    1000.0
+                    1500.0
                 )];
 
     BHFLabel = label;
@@ -745,7 +773,7 @@ static void BHFCreateOverlay(void)
     scroll.contentSize =
         CGSizeMake(
             width,
-            1000.0
+            1500.0
         );
 
     [BHFWindow addSubview:scroll];
@@ -767,30 +795,41 @@ static NSString *BHFStackText(void)
          i++) {
 
         NSString *image =
-            BHFStackImages[i];
+            @"unknown";
 
         NSString *symbol =
-            BHFStackSymbols[i];
+            @"unknown";
 
-        if (image == nil) {
-            image = @"unknown";
+        if (BHFStackImages[i][0] != '\0') {
+
+            image =
+                [NSString stringWithUTF8String:
+                    BHFStackImages[i]];
+
+            if (image == nil) {
+                image = @"unknown";
+            }
         }
 
-        if (symbol == nil) {
-            symbol = @"unknown";
+        if (BHFStackSymbols[i][0] != '\0') {
+
+            symbol =
+                [NSString stringWithUTF8String:
+                    BHFStackSymbols[i]];
+
+            if (symbol == nil) {
+                symbol = @"unknown";
+            }
         }
 
         NSString *shortImage =
             image;
 
-        /*
-         Make system paths easier to read.
-        */
-
         if ([image hasPrefix:@"/usr/lib/"]) {
 
             shortImage =
                 [image substringFromIndex:9];
+
         }
         else if ([image hasPrefix:@"/System/Library/"]) {
 
@@ -808,6 +847,10 @@ static NSString *BHFStackText(void)
              (unsigned long long)
                  BHFStackOffsets[i]
         ];
+    }
+
+    if (BHFStackCount == 0) {
+        return @"No readable frames\n";
     }
 
     return result;
@@ -847,8 +890,8 @@ static void BHFUpdateOverlay(void)
             BHFLastHotThread) {
 
             BHFSameThreadSamples++;
-        }
-        else {
+
+        } else {
 
             BHFLastHotThread =
                 hotThread;
@@ -870,17 +913,50 @@ static void BHFUpdateOverlay(void)
     NSString *status;
 
     if (cpu >= 80.0) {
+
         status = @"HIGH CPU";
+
     }
     else if (cpu >= 40.0) {
+
         status = @"ELEVATED";
+
     }
     else {
+
         status = @"NORMAL";
     }
 
     NSString *stack =
         BHFStackText();
+
+    NSString *currentImage =
+        @"unknown";
+
+    NSString *currentSymbol =
+        @"unknown";
+
+    if (BHFCurrentImage[0] != '\0') {
+
+        NSString *tmp =
+            [NSString stringWithUTF8String:
+                BHFCurrentImage];
+
+        if (tmp != nil) {
+            currentImage = tmp;
+        }
+    }
+
+    if (BHFCurrentSymbol[0] != '\0') {
+
+        NSString *tmp =
+            [NSString stringWithUTF8String:
+                BHFCurrentSymbol];
+
+        if (tmp != nil) {
+            currentSymbol = tmp;
+        }
+    }
 
     NSString *text =
         [NSString stringWithFormat:
@@ -927,10 +1003,10 @@ static void BHFUpdateOverlay(void)
              found ? hotThreadCPU : 0.0,
              (unsigned long)BHFSameThreadSamples,
              (unsigned long long)BHFCurrentPC,
-             BHFCurrentImage,
+             currentImage,
              (unsigned long long)BHFCurrentImageBase,
              (unsigned long long)BHFCurrentImageOffset,
-             BHFCurrentSymbol,
+             currentSymbol,
              stack
         ];
 
