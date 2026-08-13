@@ -5,9 +5,9 @@
 #import <mach/mach.h>
 #import <mach/mach_init.h>
 #import <mach/thread_info.h>
+#import <mach/arm/thread_status.h>
 
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
+#import <dlfcn.h>
 
 static UIWindow *BHFWindow = nil;
 static UILabel *BHFLabel = nil;
@@ -27,6 +27,13 @@ static NSUInteger BHFTotalSamples = 0;
 static thread_t BHFLastHotThread = MACH_PORT_NULL;
 static NSUInteger BHFSameThreadSamples = 0;
 
+static uintptr_t BHFLastPC = 0;
+static uintptr_t BHFLastImageBase = 0;
+static uintptr_t BHFLastImageOffset = 0;
+
+static NSString *BHFLastImage = @"unknown";
+static NSString *BHFLastSymbol = @"unknown";
+
 static NSUInteger BHFBumbleSamples = 0;
 static NSUInteger BHFYapSamples = 0;
 static NSUInteger BHFObjCSamples = 0;
@@ -34,12 +41,6 @@ static NSUInteger BHFFoundationSamples = 0;
 static NSUInteger BHFCoreFoundationSamples = 0;
 static NSUInteger BHFSystemSamples = 0;
 static NSUInteger BHFOtherSamples = 0;
-
-static uintptr_t BHFLastPC = 0;
-static uintptr_t BHFLastImageBase = 0;
-static uintptr_t BHFLastImageOffset = 0;
-
-static NSString *BHFLastImage = @"unknown";
 
 #pragma mark - Network
 
@@ -62,8 +63,7 @@ static NSString *BHFNetworkState(void)
 
 static void BHFStartNetworkMonitor(void)
 {
-    BHFNetworkMonitor =
-        nw_path_monitor_create();
+    BHFNetworkMonitor = nw_path_monitor_create();
 
     if (BHFNetworkMonitor == NULL) {
         return;
@@ -170,8 +170,10 @@ static double BHFCPUUsage(void)
     return totalCPU;
 }
 
-static BOOL BHFGetHotThread(thread_t *resultThread,
-                            double *resultCPU)
+static BOOL BHFGetHotThread(
+    thread_t *resultThread,
+    double *resultCPU
+)
 {
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t threadCount = 0;
@@ -247,125 +249,63 @@ static BOOL BHFGetHotThread(thread_t *resultThread,
     return YES;
 }
 
-#pragma mark - Image lookup
+#pragma mark - Address resolver
 
-static const struct mach_header_64 *
-BHFHeaderForImageIndex(uint32_t index)
+static void BHFResolveAddress(uintptr_t address)
 {
-    const struct mach_header *header =
-        _dyld_get_image_header(index);
+    BHFLastImage = @"unknown";
+    BHFLastSymbol = @"unknown";
+    BHFLastImageBase = 0;
+    BHFLastImageOffset = 0;
 
-    if (header == NULL) {
-        return NULL;
+    if (address == 0) {
+        return;
     }
 
-    if (header->magic != MH_MAGIC_64) {
-        return NULL;
+    Dl_info info;
+
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
+
+    int result =
+        dladdr(
+            (const void *)address,
+            &info
+        );
+
+    if (result == 0) {
+        return;
     }
 
-    return (const struct mach_header_64 *)header;
-}
+    if (info.dli_fname != NULL) {
 
-static NSString *BHFImageForAddress(
-    uintptr_t address,
-    uintptr_t *baseOut,
-    uintptr_t *offsetOut
-)
-{
-    uint32_t count =
-        _dyld_image_count();
+        BHFLastImage =
+            [NSString stringWithUTF8String:
+                info.dli_fname];
+    }
 
-    for (uint32_t i = 0;
-         i < count;
-         i++) {
+    if (info.dli_sname != NULL) {
 
-        const struct mach_header_64 *header =
-            BHFHeaderForImageIndex(i);
+        BHFLastSymbol =
+            [NSString stringWithUTF8String:
+                info.dli_sname];
+    }
 
-        if (header == NULL) {
-            continue;
-        }
+    if (info.dli_fbase != NULL) {
 
-        intptr_t slide =
-            _dyld_get_image_vmaddr_slide(i);
+        BHFLastImageBase =
+            (uintptr_t)info.dli_fbase;
 
-        uintptr_t base =
-            (uintptr_t)header +
-            (uintptr_t)slide;
+        if (address >= BHFLastImageBase) {
 
-        const char *name =
-            _dyld_get_image_name(i);
-
-        if (name == NULL) {
-            continue;
-        }
-
-        uintptr_t imageEnd =
-            base;
-
-        const uint8_t *commandPtr =
-            (const uint8_t *)(header + 1);
-
-        for (uint32_t commandIndex = 0;
-             commandIndex < header->ncmds;
-             commandIndex++) {
-
-            const struct load_command *command =
-                (const struct load_command *)commandPtr;
-
-            if (command->cmdsize <
-                sizeof(struct load_command)) {
-                break;
-            }
-
-            if (command->cmd ==
-                LC_SEGMENT_64) {
-
-                const struct segment_command_64 *segment =
-                    (const struct segment_command_64 *)command;
-
-                uintptr_t segmentStart =
-                    (uintptr_t)segment->vmaddr +
-                    (uintptr_t)slide;
-
-                uintptr_t segmentEnd =
-                    segmentStart +
-                    (uintptr_t)segment->vmsize;
-
-                if (segmentEnd > imageEnd) {
-                    imageEnd = segmentEnd;
-                }
-            }
-
-            commandPtr += command->cmdsize;
-        }
-
-        if (address >= base &&
-            address < imageEnd) {
-
-            if (baseOut != NULL) {
-                *baseOut = base;
-            }
-
-            if (offsetOut != NULL) {
-                *offsetOut =
-                    address - base;
-            }
-
-            return
-                [NSString stringWithUTF8String:name];
+            BHFLastImageOffset =
+                address -
+                BHFLastImageBase;
         }
     }
-
-    if (baseOut != NULL) {
-        *baseOut = 0;
-    }
-
-    if (offsetOut != NULL) {
-        *offsetOut = 0;
-    }
-
-    return @"unknown";
 }
 
 #pragma mark - Classification
@@ -440,7 +380,7 @@ static void BHFCreateOverlay(void)
                 8.0,
                 35.0,
                 width,
-                420.0
+                430.0
             )];
 
     BHFWindow.windowLevel =
@@ -462,7 +402,7 @@ static void BHFCreateOverlay(void)
                 12.0,
                 10.0,
                 width - 24.0,
-                400.0
+                410.0
             )];
 
     BHFLabel.textColor =
@@ -470,7 +410,7 @@ static void BHFCreateOverlay(void)
 
     BHFLabel.font =
         [UIFont monospacedSystemFontOfSize:
-            11.5
+            11.0
             weight:UIFontWeightRegular];
 
     BHFLabel.numberOfLines = 0;
@@ -528,8 +468,7 @@ static void BHFUpdateOverlay(void)
             BHFSameThreadSamples = 1;
         }
 
-        BHFLastPC =
-            0;
+        BHFLastPC = 0;
 
         mach_msg_type_number_t count =
             ARM_THREAD_STATE64_COUNT;
@@ -550,12 +489,9 @@ static void BHFUpdateOverlay(void)
                 (uintptr_t)state.__pc;
         }
 
-        BHFLastImage =
-            BHFImageForAddress(
-                BHFLastPC,
-                &BHFLastImageBase,
-                &BHFLastImageOffset
-            );
+        BHFResolveAddress(
+            BHFLastPC
+        );
 
         BHFClassifyImage(
             BHFLastImage
@@ -580,7 +516,7 @@ static void BHFUpdateOverlay(void)
     NSString *text =
         [NSString stringWithFormat:
             @"BumbleHeatFix\n"
-             @"CPU SOURCE TRACKER v4.0\n"
+             @"ADDRESS RESOLVER v5.0\n"
              @"\n"
              @"CPU: %.1f%%\n"
              @"Peak: %.1f%%\n"
@@ -593,11 +529,16 @@ static void BHFUpdateOverlay(void)
              @"CPU: %.1f%%\n"
              @"Same thread: %lu\n"
              @"\n"
+             @"CURRENT PC\n"
+             @"0x%llx\n"
+             @"\n"
              @"CURRENT IMAGE\n"
              @"%@\n"
              @"BASE: 0x%llx\n"
              @"OFFSET: +0x%llx\n"
-             @"PC: 0x%llx\n"
+             @"\n"
+             @"SYMBOL\n"
+             @"%@\n"
              @"\n"
              @"SOURCE SAMPLES\n"
              @"Bumble: %lu\n"
@@ -624,10 +565,11 @@ static void BHFUpdateOverlay(void)
              found ? hotThread : 0,
              found ? hotThreadCPU : 0.0,
              (unsigned long)BHFSameThreadSamples,
+             (unsigned long long)BHFLastPC,
              BHFLastImage,
              (unsigned long long)BHFLastImageBase,
              (unsigned long long)BHFLastImageOffset,
-             (unsigned long long)BHFLastPC,
+             BHFLastSymbol,
              (unsigned long)BHFBumbleSamples,
              (unsigned long)BHFYapSamples,
              (unsigned long)BHFObjCSamples,
