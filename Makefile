@@ -1,12 +1,10 @@
-TARGET := iphone:clang:latest:14.0
-ARCHS = arm64
+TARGET := iphone:clang:16.0
+ARCHS = arm64 arm64e
+
+TWEAK_NAME = ThermalThrottle
+ThermalThrottle_FILES = Tweak.xm
+ThermalThrottle_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+ThermalThrottle_LDFLAGS = -framework Foundation -framework UIKit -framework CoreLocation
 
 include $(THEOS)/makefiles/common.mk
-
-TWEAK_NAME = BumbleHeatFix
-
-BumbleHeatFix_FILES = Tweak.x
-BumbleHeatFix_CFLAGS = -fobjc-arc
-BumbleHeatFix_FRAMEWORKS = Foundation UIKit Network
-
 include $(THEOS_MAKE_PATH)/tweak.mk
