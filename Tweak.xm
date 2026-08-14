@@ -27,12 +27,13 @@ static BOOL gpsKilledForIdle = NO;
 + (void)resetIdleTimer;
 + (void)performDynamicSwizzling;
 + (void)swizzleMethod:(SEL)originalSelector onClass:(Class)cls withPattern:(NSString *)pattern;
++ (void)updateOverlay;
 @end
 
 @implementation ThermalThrottleManager
 
 // ============================================================
-//  UI OVERLAY - FIXED FOR NOTCH / DYNAMIC ISLAND
+//  UI OVERLAY - FIXED FOR NOTCH (iPhone 11 Pro)
 // ============================================================
 + (void)updateOverlay {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -40,45 +41,50 @@ static BOOL gpsKilledForIdle = NO;
             UIWindowScene *scene = [UIApplication sharedApplication].keyWindow.windowScene;
             if (!scene) return;
             
-            // Get safe area insets to avoid the notch
             UIEdgeInsets safeInsets = UIApplication.sharedApplication.keyWindow.safeAreaInsets;
             CGFloat topInset = safeInsets.top;
-            
-            // Position overlay below the notch/status bar
             CGFloat overlayHeight = 44;
-            CGFloat overlayY = topInset; // Start right below the notch
+            CGFloat overlayY = topInset;
             
             overlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
             overlayWindow.frame = CGRectMake(0, overlayY, [UIScreen mainScreen].bounds.size.width, overlayHeight);
             overlayWindow.windowLevel = UIWindowLevelStatusBar + 1;
             overlayWindow.backgroundColor = [UIColor clearColor];
-            overlayWindow.userInteractionEnabled = YES; // IMPORTANT: Enable interaction
+            overlayWindow.userInteractionEnabled = YES;
             
             overlayLabel = [[UILabel alloc] initWithFrame:overlayWindow.bounds];
             overlayLabel.textAlignment = NSTextAlignmentCenter;
-            overlayLabel.font = [UIFont boldSystemFontOfSize:15];
+            overlayLabel.font = [UIFont boldSystemFontOfSize:13];
             overlayLabel.textColor = [UIColor whiteColor];
             overlayLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
             overlayLabel.layer.cornerRadius = 10;
             overlayLabel.clipsToBounds = YES;
+            overlayLabel.numberOfLines = 1;
             [overlayWindow addSubview:overlayLabel];
             
-            // Make the entire overlay tappable
             UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[ThermalThrottleManager class] 
                                                                                  action:@selector(toggleThrottle)];
             tap.numberOfTapsRequired = 3;
             [overlayWindow addGestureRecognizer:tap];
             
-            // Make it visible
             overlayWindow.hidden = NO;
         }
         
-        // Update text
+        // Build detailed status string
         if (isThrottlingActive) {
-            overlayLabel.text = @"🔥 Throttling ON (triple-tap to toggle)";
-            overlayLabel.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.1 alpha:0.75];
+            NSMutableString *status = [NSMutableString stringWithString:@"🔥 "];
+            if (gpsKilledForIdle) {
+                [status appendString:@"📍OFF "];
+            } else {
+                [status appendString:@"📍LOW "];
+            }
+            [status appendString:@"🖥️30fps "];
+            [status appendString:@"🌐⏳ "];
+            [status appendString:@"🔋⚡"];
+            overlayLabel.text = status;
+            overlayLabel.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.1 alpha:0.8];
         } else {
-            overlayLabel.text = @"⛔ Throttling OFF (triple-tap to toggle)";
+            overlayLabel.text = @"⛔ Throttling OFF (tap 3x)";
             overlayLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.6];
         }
     });
@@ -94,7 +100,6 @@ static BOOL gpsKilledForIdle = NO;
     [self updateCombinedState];
     NSLog(@"[Thermal] Manual toggle: %@", manualThrottleEnabled ? @"ON" : @"OFF");
     
-    // Show a quick visual feedback
     dispatch_async(dispatch_get_main_queue(), ^{
         if (overlayLabel) {
             overlayLabel.text = isThrottlingActive ? @"🔥 Toggled ON!" : @"⛔ Toggled OFF!";
@@ -127,17 +132,18 @@ static BOOL gpsKilledForIdle = NO;
 }
 
 // ============================================================
-//  IDLE TIMER
+//  IDLE TIMER - NOW 15 SECONDS
 // ============================================================
 + (void)resetIdleTimer {
     [idleTimer invalidate];
-    idleTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 
+    idleTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 
                                                  repeats:NO 
                                                    block:^(NSTimer *timer) {
         if (currentThermalState >= NSProcessInfoThermalStateFair || isThrottlingActive) {
-            NSLog(@"[Thermal] 💤 User idle for 30s - killing GPS until next touch");
+            NSLog(@"[Thermal] 💤 User idle for 15s - killing GPS");
             [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalKillGPS" object:nil];
             gpsKilledForIdle = YES;
+            [self updateOverlay];
         }
     }];
 }
@@ -204,14 +210,14 @@ static BOOL gpsKilledForIdle = NO;
                 [pattern isEqualToString:@"refreshFeed"] ||
                 [pattern isEqualToString:@"loadMatches"]) {
                 
-                NSLog(@"[Thermal] ⏳ Delaying %@ on %@ due to throttling", pattern, NSStringFromClass(cls));
+                NSLog(@"[Thermal] ⏳ Delaying %@ on %@", pattern, NSStringFromClass(cls));
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     NSLog(@"[Thermal] 🔹 Executing delayed %@", pattern);
                 });
                 return;
             }
         }
-        NSLog(@"[Thermal] 🔹 Executing %@ on %@ (throttling %@)", pattern, NSStringFromClass(cls), isThrottlingActive ? @"ON" : @"OFF");
+        NSLog(@"[Thermal] 🔹 Executing %@ on %@", pattern, NSStringFromClass(cls));
     });
     
     class_replaceMethod(cls, originalSelector, newImp, method_getTypeEncoding(originalMethod));
@@ -224,31 +230,26 @@ static BOOL gpsKilledForIdle = NO;
 //  SYSTEM HOOKS - LOCATION
 // ============================================================
 %hook CLLocationManager
-
 - (void)startUpdatingLocation {
     if (isThrottlingActive || gpsKilledForIdle) {
         self.desiredAccuracy = kCLLocationAccuracyKilometer;
         self.distanceFilter = 100.0;
-        NSLog(@"[Thermal] 📍 Location: low accuracy due to throttling");
+        NSLog(@"[Thermal] 📍 Location: low accuracy");
     }
     %orig;
 }
-
 - (void)setDesiredAccuracy:(CLLocationAccuracy)accuracy {
     if (isThrottlingActive || gpsKilledForIdle) {
         accuracy = kCLLocationAccuracyKilometer;
-        NSLog(@"[Thermal] 📍 Location: forced accuracy downgrade");
     }
     %orig(accuracy);
 }
-
 %end
 
 // ============================================================
 //  SYSTEM HOOKS - FRAME RATE
 // ============================================================
 %hook CADisplayLink
-
 + (CADisplayLink *)displayLinkWithTarget:(id)target selector:(SEL)sel {
     CADisplayLink *link = %orig(target, sel);
     if (isThrottlingActive) {
@@ -261,21 +262,18 @@ static BOOL gpsKilledForIdle = NO;
     }
     return link;
 }
-
 - (void)setPreferredFramesPerSecond:(NSInteger)preferredFramesPerSecond {
     if (isThrottlingActive) {
         preferredFramesPerSecond = MIN(preferredFramesPerSecond, 30);
     }
     %orig(preferredFramesPerSecond);
 }
-
 %end
 
 // ============================================================
-//  SYSTEM HOOKS - NETWORK
+//  SYSTEM HOOKS - NETWORK & IMAGE PRIORITY
 // ============================================================
 %hook NSURLSessionDataTask
-
 - (void)resume {
     if (isThrottlingActive) {
         NSURL *url = self.currentRequest.URL;
@@ -286,10 +284,9 @@ static BOOL gpsKilledForIdle = NO;
             [urlString containsString:@"image"] ||
             [urlString containsString:@"photo"] ||
             [urlString containsString:@"avatar"]) {
-            
             if ([self respondsToSelector:@selector(setPriority:)]) {
                 self.priority = NSURLSessionTaskPriorityLow;
-                NSLog(@"[Thermal] 🖼️ Image download set to LOW priority");
+                NSLog(@"[Thermal] 🖼️ Image priority LOW");
             }
         }
         
@@ -298,7 +295,6 @@ static BOOL gpsKilledForIdle = NO;
             [urlString containsString:@"image"] ||
             [urlString containsString:@"profile"] ||
             [urlString containsString:@"sync"]) {
-            
             NSLog(@"[Thermal] 🌐 Delaying network request: %@", urlString);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), 
                            dispatch_get_main_queue(), ^{
@@ -309,26 +305,137 @@ static BOOL gpsKilledForIdle = NO;
     }
     %orig;
 }
-
 %end
 
 // ============================================================
-//  SYSTEM HOOKS - BACKGROUND TASKS
+//  NEW: WebSocket Throttling
+// ============================================================
+%hook NSURLSessionWebSocketTask
+- (void)resume {
+    if (isThrottlingActive) {
+        NSLog(@"[Thermal] 🔌 WebSocket connection delayed");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), 
+                       dispatch_get_main_queue(), ^{
+            %orig;
+        });
+        return;
+    }
+    %orig;
+}
+- (void)sendMessage:(NSURLSessionWebSocketMessage *)message 
+ completionHandler:(void (^)(NSError *error))completionHandler {
+    if (isThrottlingActive) {
+        static NSDate *lastSendTime = nil;
+        NSDate *now = [NSDate date];
+        if (lastSendTime && [now timeIntervalSinceDate:lastSendTime] < 2.0) {
+            NSLog(@"[Thermal] 🔌 WebSocket message throttled");
+            return;
+        }
+        lastSendTime = now;
+    }
+    %orig(message, completionHandler);
+}
+%end
+
+// ============================================================
+//  NEW: CPU THROTTLING - Lower thread priority
+// ============================================================
+%hook NSThread
++ (void)setThreadPriority:(double)priority {
+    if (isThrottlingActive) {
+        priority = MIN(priority, 0.5);
+        NSLog(@"[Thermal] 🧠 CPU thread priority lowered");
+    }
+    %orig(priority);
+}
+%end
+
+%hook NSRunLoop
+- (void)runMode:(NSRunLoopMode)mode beforeDate:(NSDate *)limitDate {
+    if (isThrottlingActive) {
+        [NSThread sleepForTimeInterval:0.01];
+    }
+    %orig(mode, limitDate);
+}
+%end
+
+// ============================================================
+//  NEW: SCREEN DIMMING
+// ============================================================
+%hook UIScreen
+- (CGFloat)brightness {
+    if (isThrottlingActive) {
+        CGFloat current = %orig;
+        return current * 0.6; // 60% brightness
+    }
+    return %orig;
+}
+%end
+
+// ============================================================
+//  NEW: CACHE THROTTLING
+// ============================================================
+%hook NSURLCache
+- (NSCachedURLResponse *)cachedResponseForRequest:(NSURLRequest *)request {
+    if (isThrottlingActive) {
+        NSCachedURLResponse *cached = %orig(request);
+        if (cached) {
+            NSLog(@"[Thermal] 📦 Using cached response");
+            return cached;
+        }
+    }
+    return %orig(request);
+}
+%end
+
+// ============================================================
+//  NEW: SENSOR THROTTLING (Motion/Accelerometer)
+// ============================================================
+%hook CMMotionManager
+- (void)startAccelerometerUpdates {
+    if (isThrottlingActive) {
+        NSLog(@"[Thermal] 📱 Accelerometer throttled");
+        return;
+    }
+    %orig;
+}
+- (void)startGyroUpdates {
+    if (isThrottlingActive) {
+        NSLog(@"[Thermal] 📱 Gyroscope throttled");
+        return;
+    }
+    %orig;
+}
+- (void)startDeviceMotionUpdates {
+    if (isThrottlingActive) {
+        NSLog(@"[Thermal] 📱 Device motion throttled");
+        return;
+    }
+    %orig;
+}
+%end
+
+// ============================================================
+//  SYSTEM HOOKS - BACKGROUND TASKS & UIApplication
 // ============================================================
 %hook UIApplication
 
 - (UIBackgroundTaskIdentifier)beginBackgroundTaskWithName:(NSString *)taskName 
                                          expirationHandler:(void (^)(void))handler {
     if (isThrottlingActive) {
-        NSLog(@"[Thermal] ⏱️ Reducing background task time for: %@", taskName);
+        if (handler) {
+            handler(); // immediately expire
+        }
+        NSLog(@"[Thermal] ⏱️ Background task immediately expired");
+        return UIBackgroundTaskInvalid;
     }
     return %orig(taskName, handler);
 }
 
 - (void)setMinimumBackgroundFetchInterval:(NSTimeInterval)minimumBackgroundFetchInterval {
     if (isThrottlingActive) {
-        minimumBackgroundFetchInterval = 86400; // 24 hours
-        NSLog(@"[Thermal] ⏱️ Background fetch interval extended to 24h");
+        minimumBackgroundFetchInterval = 86400; // 24h
+        NSLog(@"[Thermal] ⏱️ Background fetch interval extended");
     }
     %orig(minimumBackgroundFetchInterval);
 }
@@ -339,9 +446,18 @@ static BOOL gpsKilledForIdle = NO;
         if (gpsKilledForIdle) {
             gpsKilledForIdle = NO;
             NSLog(@"[Thermal] 👆 Touch detected - restoring GPS");
+            [ThermalThrottleManager updateOverlay];
         }
         [ThermalThrottleManager resetIdleTimer];
     }
+}
+
+- (UIBackgroundTaskIdentifier)beginBackgroundTaskWithExpirationHandler:(void (^)(void))handler {
+    if (isThrottlingActive) {
+        if (handler) handler();
+        return UIBackgroundTaskInvalid;
+    }
+    return %orig(handler);
 }
 
 %end
@@ -350,7 +466,6 @@ static BOOL gpsKilledForIdle = NO;
 //  SYSTEM HOOKS - SCROLLING
 // ============================================================
 %hook UITableView
-
 - (void)setDecelerationRate:(CGFloat)decelerationRate {
     if (isThrottlingActive) {
         decelerationRate = UIScrollViewDecelerationRateNormal;
@@ -358,7 +473,6 @@ static BOOL gpsKilledForIdle = NO;
     }
     %orig(decelerationRate);
 }
-
 - (void)setPrefetchingEnabled:(BOOL)prefetchingEnabled {
     if (isThrottlingActive) {
         prefetchingEnabled = NO;
@@ -366,39 +480,35 @@ static BOOL gpsKilledForIdle = NO;
     }
     %orig(prefetchingEnabled);
 }
-
 %end
 
 %hook UICollectionView
-
 - (void)setPrefetchingEnabled:(BOOL)prefetchingEnabled {
     if (isThrottlingActive) {
         prefetchingEnabled = NO;
     }
     %orig(prefetchingEnabled);
 }
-
 %end
 
 // ============================================================
-//  SYSTEM HOOKS - APP DELEGATE
+//  APP DELEGATE - Background/Foreground
 // ============================================================
 %hook AppDelegate
-
 - (void)applicationDidEnterBackground:(UIApplication *)application {
     %orig;
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalKillGPS" object:nil];
     gpsKilledForIdle = YES;
-    NSLog(@"[Thermal] 📍 GPS killed for background idle");
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalKillGPS" object:nil];
+    NSLog(@"[Thermal] 📍 GPS killed for background");
+    [ThermalThrottleManager updateOverlay];
 }
-
 - (void)applicationWillEnterForeground:(UIApplication *)application {
     %orig;
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalRestoreGPS" object:nil];
     gpsKilledForIdle = NO;
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalRestoreGPS" object:nil];
     NSLog(@"[Thermal] 📍 GPS restored for foreground");
+    [ThermalThrottleManager updateOverlay];
 }
-
 %end
 
 // ============================================================
@@ -407,35 +517,41 @@ static BOOL gpsKilledForIdle = NO;
 %ctor {
     NSLog(@"[Thermal] ✅ Thermal throttling dylib loaded!");
     
-    // Load manual toggle from preferences
     manualThrottleEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:kManualToggleKey];
     
-    // Start thermal monitoring
-    [NSTimer scheduledTimerWithTimeInterval:2.0 
+    // Monitor thermal state every 1.5 seconds
+    [NSTimer scheduledTimerWithTimeInterval:1.5 
                                      repeats:YES 
                                      block:^(NSTimer *timer) {
         NSProcessInfoThermalState newState = [NSProcessInfo processInfo].thermalState;
         BOOL wasThermalActive = thermalActive;
-        thermalActive = (newState >= NSProcessInfoThermalStateSerious);
+        
+        // Activate at FAIR (earlier than SERIOUS)
+        thermalActive = (newState >= NSProcessInfoThermalStateFair);
         
         if (thermalActive != wasThermalActive) {
             NSString *stateName = @"Nominal";
-            if (newState == NSProcessInfoThermalStateFair) stateName = @"Fair ⚠️";
+            if (newState == NSProcessInfoThermalStateFair) stateName = @"Fair ⚠️ (throttling ON)";
             else if (newState == NSProcessInfoThermalStateSerious) stateName = @"Serious 🔥";
             else if (newState == NSProcessInfoThermalStateCritical) stateName = @"Critical 🚨";
             NSLog(@"[Thermal] Thermal state: %@", stateName);
         }
         
         [ThermalThrottleManager updateCombinedState];
+        
+        // If critical, dim screen further
+        if (newState == NSProcessInfoThermalStateCritical) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [UIScreen mainScreen].brightness = 0.3;
+            });
+        }
     }];
     
-    // Delay overlay creation until app is ready
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [ThermalThrottleManager updateCombinedState];
         [ThermalThrottleManager updateOverlay];
     });
     
-    // Run dynamic swizzling after classes load
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [ThermalThrottleManager performDynamicSwizzling];
     });
