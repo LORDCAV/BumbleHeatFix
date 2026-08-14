@@ -1,4 +1,4 @@
-TARGET := iphone:clang:16.0
+TARGET := iphone:clang:latest
 ARCHS = arm64 arm64e
 
 TWEAK_NAME = ThermalThrottle
