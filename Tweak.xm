@@ -32,7 +32,7 @@ static BOOL gpsKilledForIdle = NO;
 @implementation ThermalThrottleManager
 
 // ============================================================
-//  UI OVERLAY
+//  UI OVERLAY - FIXED FOR NOTCH / DYNAMIC ISLAND
 // ============================================================
 + (void)updateOverlay {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -40,34 +40,46 @@ static BOOL gpsKilledForIdle = NO;
             UIWindowScene *scene = [UIApplication sharedApplication].keyWindow.windowScene;
             if (!scene) return;
             
+            // Get safe area insets to avoid the notch
+            UIEdgeInsets safeInsets = UIApplication.sharedApplication.keyWindow.safeAreaInsets;
+            CGFloat topInset = safeInsets.top;
+            
+            // Position overlay below the notch/status bar
+            CGFloat overlayHeight = 44;
+            CGFloat overlayY = topInset; // Start right below the notch
+            
             overlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
-            overlayWindow.frame = CGRectMake(0, 0, [UIScreen mainScreen].bounds.size.width, 44);
+            overlayWindow.frame = CGRectMake(0, overlayY, [UIScreen mainScreen].bounds.size.width, overlayHeight);
             overlayWindow.windowLevel = UIWindowLevelStatusBar + 1;
             overlayWindow.backgroundColor = [UIColor clearColor];
-            overlayWindow.userInteractionEnabled = NO;
+            overlayWindow.userInteractionEnabled = YES; // IMPORTANT: Enable interaction
             
             overlayLabel = [[UILabel alloc] initWithFrame:overlayWindow.bounds];
             overlayLabel.textAlignment = NSTextAlignmentCenter;
-            overlayLabel.font = [UIFont boldSystemFontOfSize:14];
+            overlayLabel.font = [UIFont boldSystemFontOfSize:15];
             overlayLabel.textColor = [UIColor whiteColor];
-            overlayLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.6];
-            overlayLabel.layer.cornerRadius = 8;
+            overlayLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
+            overlayLabel.layer.cornerRadius = 10;
             overlayLabel.clipsToBounds = YES;
             [overlayWindow addSubview:overlayLabel];
             
-            // Use the class itself as target, not 'self' inside block
+            // Make the entire overlay tappable
             UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[ThermalThrottleManager class] 
                                                                                  action:@selector(toggleThrottle)];
             tap.numberOfTapsRequired = 3;
             [overlayWindow addGestureRecognizer:tap];
+            
+            // Make it visible
+            overlayWindow.hidden = NO;
         }
         
+        // Update text
         if (isThrottlingActive) {
-            overlayLabel.text = @"🔥 Throttling ON";
-            overlayWindow.hidden = NO;
+            overlayLabel.text = @"🔥 Throttling ON (triple-tap to toggle)";
+            overlayLabel.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.1 alpha:0.75];
         } else {
-            overlayLabel.text = @"⛔ Throttling OFF";
-            overlayWindow.hidden = NO;
+            overlayLabel.text = @"⛔ Throttling OFF (triple-tap to toggle)";
+            overlayLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.6];
         }
     });
 }
@@ -81,6 +93,20 @@ static BOOL gpsKilledForIdle = NO;
     [[NSUserDefaults standardUserDefaults] synchronize];
     [self updateCombinedState];
     NSLog(@"[Thermal] Manual toggle: %@", manualThrottleEnabled ? @"ON" : @"OFF");
+    
+    // Show a quick visual feedback
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (overlayLabel) {
+            overlayLabel.text = isThrottlingActive ? @"🔥 Toggled ON!" : @"⛔ Toggled OFF!";
+            [UIView animateWithDuration:0.3 animations:^{
+                overlayLabel.alpha = 1.0;
+            } completion:^(BOOL finished) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self updateOverlay];
+                });
+            }];
+        }
+    });
 }
 
 + (void)updateCombinedState {
