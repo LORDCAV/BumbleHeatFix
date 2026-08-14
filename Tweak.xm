@@ -4,7 +4,7 @@
 #import <objc/runtime.h>
 
 // ============================================================
-//  GLOBAL STATE & PREFERENCES
+//  GLOBAL STATE
 // ============================================================
 static NSProcessInfoThermalState currentThermalState = NSProcessInfoThermalStateNominal;
 static BOOL manualThrottleEnabled = NO;
@@ -18,17 +18,23 @@ static NSTimer *idleTimer = nil;
 static BOOL gpsKilledForIdle = NO;
 
 // ============================================================
-//  UI OVERLAY
+//  THERMALTHROTTLEMANAGER CLASS
 // ============================================================
-@interface OverlayView : UIView
-@end
-@implementation OverlayView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    return nil;
-}
+@interface ThermalThrottleManager : NSObject
++ (void)toggleThrottle;
++ (void)updateCombinedState;
++ (void)applyThrottlingState;
++ (void)resetIdleTimer;
++ (void)performDynamicSwizzling;
++ (void)swizzleMethod:(SEL)originalSelector onClass:(Class)cls withPattern:(NSString *)pattern;
 @end
 
-static void updateOverlay() {
+@implementation ThermalThrottleManager
+
+// ============================================================
+//  UI OVERLAY
+// ============================================================
++ (void)updateOverlay {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!overlayWindow) {
             UIWindowScene *scene = [UIApplication sharedApplication].keyWindow.windowScene;
@@ -49,7 +55,9 @@ static void updateOverlay() {
             overlayLabel.clipsToBounds = YES;
             [overlayWindow addSubview:overlayLabel];
             
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleThrottle)];
+            // Use the class itself as target, not 'self' inside block
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[ThermalThrottleManager class] 
+                                                                                 action:@selector(toggleThrottle)];
             tap.numberOfTapsRequired = 3;
             [overlayWindow addGestureRecognizer:tap];
         }
@@ -64,6 +72,9 @@ static void updateOverlay() {
     });
 }
 
+// ============================================================
+//  TOGGLE & STATE MANAGEMENT
+// ============================================================
 + (void)toggleThrottle {
     manualThrottleEnabled = !manualThrottleEnabled;
     [[NSUserDefaults standardUserDefaults] setBool:manualThrottleEnabled forKey:kManualToggleKey];
@@ -74,12 +85,11 @@ static void updateOverlay() {
 
 + (void)updateCombinedState {
     isThrottlingActive = manualThrottleEnabled || thermalActive;
-    updateOverlay();
+    [self updateOverlay];
     [self applyThrottlingState];
 }
 
 + (void)applyThrottlingState {
-    // Notify system of throttling
     if (isThrottlingActive) {
         [[NSProcessInfo processInfo] performExpiringActivityWithReason:@"Thermal throttling" 
                                                              usingBlock:^(BOOL expired) {
@@ -91,7 +101,7 @@ static void updateOverlay() {
 }
 
 // ============================================================
-//  IDLE TIMER MANAGEMENT
+//  IDLE TIMER
 // ============================================================
 + (void)resetIdleTimer {
     [idleTimer invalidate];
@@ -170,7 +180,6 @@ static void updateOverlay() {
                 
                 NSLog(@"[Thermal] ⏳ Delaying %@ on %@ due to throttling", pattern, NSStringFromClass(cls));
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    // Call original - simplified version
                     NSLog(@"[Thermal] 🔹 Executing delayed %@", pattern);
                 });
                 return;
@@ -182,6 +191,8 @@ static void updateOverlay() {
     class_replaceMethod(cls, originalSelector, newImp, method_getTypeEncoding(originalMethod));
     NSLog(@"[Thermal] 🔄 Swizzled %@ on %@", pattern, NSStringFromClass(cls));
 }
+
+@end
 
 // ============================================================
 //  SYSTEM HOOKS - LOCATION
@@ -235,7 +246,7 @@ static void updateOverlay() {
 %end
 
 // ============================================================
-//  SYSTEM HOOKS - NETWORK & IMAGES
+//  SYSTEM HOOKS - NETWORK
 // ============================================================
 %hook NSURLSessionDataTask
 
@@ -344,7 +355,7 @@ static void updateOverlay() {
 %end
 
 // ============================================================
-//  SYSTEM HOOKS - APP DELEGATE (Background/Foreground)
+//  SYSTEM HOOKS - APP DELEGATE
 // ============================================================
 %hook AppDelegate
 
@@ -395,7 +406,7 @@ static void updateOverlay() {
     // Delay overlay creation until app is ready
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [ThermalThrottleManager updateCombinedState];
-        updateOverlay();
+        [ThermalThrottleManager updateOverlay];
     });
     
     // Run dynamic swizzling after classes load
@@ -403,43 +414,3 @@ static void updateOverlay() {
         [ThermalThrottleManager performDynamicSwizzling];
     });
 }
-
-// ============================================================
-//  THERMALTHROTTLEMANAGER CLASS (for static methods)
-// ============================================================
-@interface ThermalThrottleManager : NSObject
-+ (void)toggleThrottle;
-+ (void)updateCombinedState;
-+ (void)applyThrottlingState;
-+ (void)resetIdleTimer;
-+ (void)performDynamicSwizzling;
-+ (void)swizzleMethod:(SEL)selector onClass:(Class)cls withPattern:(NSString *)pattern;
-@end
-
-@implementation ThermalThrottleManager
-
-+ (void)toggleThrottle {
-    // Implementation above
-}
-
-+ (void)updateCombinedState {
-    // Implementation above
-}
-
-+ (void)applyThrottlingState {
-    // Implementation above
-}
-
-+ (void)resetIdleTimer {
-    // Implementation above
-}
-
-+ (void)performDynamicSwizzling {
-    // Implementation above
-}
-
-+ (void)swizzleMethod:(SEL)selector onClass:(Class)cls withPattern:(NSString *)pattern {
-    // Implementation above
-}
-
-@end
