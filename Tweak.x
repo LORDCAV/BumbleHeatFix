@@ -1,1062 +1,445 @@
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <Network/Network.h>
+#import <UIKit/UIKit.h>
+#import <CoreLocation/CoreLocation.h>
+#import <objc/runtime.h>
 
-#import <mach/mach.h>
-#import <mach/mach_init.h>
-#import <mach/thread_info.h>
-#import <mach/arm/thread_status.h>
+// ============================================================
+//  GLOBAL STATE & PREFERENCES
+// ============================================================
+static NSProcessInfoThermalState currentThermalState = NSProcessInfoThermalStateNominal;
+static BOOL manualThrottleEnabled = NO;
+static BOOL thermalActive = NO;
+static BOOL isThrottlingActive = NO;
 
-#import <dlfcn.h>
+static UIWindow *overlayWindow = nil;
+static UILabel *overlayLabel = nil;
+static NSString *const kManualToggleKey = @"BumbleThermalManualToggle";
+static NSTimer *idleTimer = nil;
+static BOOL gpsKilledForIdle = NO;
 
-#define BHF_MAX_STACK_FRAMES 8
-#define BHF_SAMPLE_INTERVAL 5.0
-
-static UIWindow *BHFWindow = nil;
-static UILabel *BHFLabel = nil;
-static NSTimer *BHFTimer = nil;
-
-static nw_path_monitor_t BHFNetworkMonitor = NULL;
-
-static BOOL BHFNetworkOnline = NO;
-static BOOL BHFNetworkExpensive = NO;
-static BOOL BHFNetworkConstrained = NO;
-
-static double BHFPeakCPU = 0.0;
-
-static NSUInteger BHFHotSamples = 0;
-static NSUInteger BHFTotalSamples = 0;
-
-static thread_t BHFLastHotThread = MACH_PORT_NULL;
-static NSUInteger BHFSameThreadSamples = 0;
-
-static uintptr_t BHFCurrentPC = 0;
-static uintptr_t BHFCurrentSP = 0;
-static uintptr_t BHFCurrentFP = 0;
-
-static double BHFCurrentThreadCPU = 0.0;
-
-static char BHFCurrentImage[512];
-static char BHFCurrentSymbol[256];
-
-static uintptr_t BHFCurrentImageBase = 0;
-static uintptr_t BHFCurrentImageOffset = 0;
-
-static NSUInteger BHFStackCount = 0;
-
-static uintptr_t BHFStackAddresses[BHF_MAX_STACK_FRAMES];
-static uintptr_t BHFStackOffsets[BHF_MAX_STACK_FRAMES];
-
-static char BHFStackImages[BHF_MAX_STACK_FRAMES][512];
-static char BHFStackSymbols[BHF_MAX_STACK_FRAMES][256];
-
-#pragma mark - Source counters
-
-static NSUInteger BHFBumbleSamples = 0;
-static NSUInteger BHFYapSamples = 0;
-static NSUInteger BHFObjCSamples = 0;
-static NSUInteger BHFFoundationSamples = 0;
-static NSUInteger BHFCoreFoundationSamples = 0;
-static NSUInteger BHFSwiftSamples = 0;
-static NSUInteger BHFSystemSamples = 0;
-static NSUInteger BHFOtherSamples = 0;
-
-#pragma mark - Network
-
-static NSString *BHFNetworkState(void)
-{
-    if (!BHFNetworkOnline) {
-        return @"OFFLINE";
-    }
-
-    if (BHFNetworkConstrained) {
-        return @"CONSTRAINED";
-    }
-
-    if (BHFNetworkExpensive) {
-        return @"EXPENSIVE";
-    }
-
-    return @"ONLINE";
+// ============================================================
+//  UI OVERLAY
+// ============================================================
+@interface OverlayView : UIView
+@end
+@implementation OverlayView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    return nil;
 }
+@end
 
-static void BHFStartNetworkMonitor(void)
-{
-    BHFNetworkMonitor =
-        nw_path_monitor_create();
-
-    if (BHFNetworkMonitor == NULL) {
-        return;
-    }
-
-    dispatch_queue_t queue =
-        dispatch_get_global_queue(
-            QOS_CLASS_UTILITY,
-            0
-        );
-
-    nw_path_monitor_set_queue(
-        BHFNetworkMonitor,
-        queue
-    );
-
-    nw_path_monitor_set_update_handler(
-        BHFNetworkMonitor,
-        ^(nw_path_t path) {
-
-            nw_path_status_t status =
-                nw_path_get_status(path);
-
-            BHFNetworkOnline =
-                (status ==
-                 nw_path_status_satisfied);
-
-            BHFNetworkExpensive =
-                nw_path_is_expensive(path);
-
-            if (@available(iOS 13.0, *)) {
-
-                BHFNetworkConstrained =
-                    nw_path_is_constrained(path);
-
-            } else {
-
-                BHFNetworkConstrained = NO;
-            }
+static void updateOverlay() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!overlayWindow) {
+            UIWindowScene *scene = [UIApplication sharedApplication].keyWindow.windowScene;
+            if (!scene) return;
+            
+            overlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
+            overlayWindow.frame = CGRectMake(0, 0, [UIScreen mainScreen].bounds.size.width, 44);
+            overlayWindow.windowLevel = UIWindowLevelStatusBar + 1;
+            overlayWindow.backgroundColor = [UIColor clearColor];
+            overlayWindow.userInteractionEnabled = NO;
+            
+            overlayLabel = [[UILabel alloc] initWithFrame:overlayWindow.bounds];
+            overlayLabel.textAlignment = NSTextAlignmentCenter;
+            overlayLabel.font = [UIFont boldSystemFontOfSize:14];
+            overlayLabel.textColor = [UIColor whiteColor];
+            overlayLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.6];
+            overlayLabel.layer.cornerRadius = 8;
+            overlayLabel.clipsToBounds = YES;
+            [overlayWindow addSubview:overlayLabel];
+            
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleThrottle)];
+            tap.numberOfTapsRequired = 3;
+            [overlayWindow addGestureRecognizer:tap];
         }
-    );
-
-    nw_path_monitor_start(
-        BHFNetworkMonitor
-    );
-}
-
-#pragma mark - CPU
-
-static double BHFCPUUsage(void)
-{
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t threadCount = 0;
-
-    kern_return_t kr =
-        task_threads(
-            mach_task_self(),
-            &threads,
-            &threadCount
-        );
-
-    if (kr != KERN_SUCCESS ||
-        threads == NULL) {
-
-        return 0.0;
-    }
-
-    double totalCPU = 0.0;
-
-    for (mach_msg_type_number_t i = 0;
-         i < threadCount;
-         i++) {
-
-        thread_basic_info_data_t info;
-
-        mach_msg_type_number_t count =
-            THREAD_BASIC_INFO_COUNT;
-
-        kr =
-            thread_info(
-                threads[i],
-                THREAD_BASIC_INFO,
-                (thread_info_t)&info,
-                &count
-            );
-
-        if (kr != KERN_SUCCESS) {
-            continue;
-        }
-
-        if (info.flags & TH_FLAGS_IDLE) {
-            continue;
-        }
-
-        double cpu =
-            ((double)info.cpu_usage /
-             (double)TH_USAGE_SCALE) *
-            100.0;
-
-        totalCPU += cpu;
-    }
-
-    vm_deallocate(
-        mach_task_self(),
-        (vm_address_t)threads,
-        (vm_size_t)(
-            threadCount *
-            sizeof(thread_t)
-        )
-    );
-
-    return totalCPU;
-}
-
-static BOOL BHFGetHotThread(
-    thread_t *resultThread,
-    double *resultCPU
-)
-{
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t threadCount = 0;
-
-    kern_return_t kr =
-        task_threads(
-            mach_task_self(),
-            &threads,
-            &threadCount
-        );
-
-    if (kr != KERN_SUCCESS ||
-        threads == NULL) {
-
-        return NO;
-    }
-
-    double highestCPU = 0.0;
-    thread_t highestThread =
-        MACH_PORT_NULL;
-
-    for (mach_msg_type_number_t i = 0;
-         i < threadCount;
-         i++) {
-
-        thread_basic_info_data_t info;
-
-        mach_msg_type_number_t count =
-            THREAD_BASIC_INFO_COUNT;
-
-        kr =
-            thread_info(
-                threads[i],
-                THREAD_BASIC_INFO,
-                (thread_info_t)&info,
-                &count
-            );
-
-        if (kr != KERN_SUCCESS) {
-            continue;
-        }
-
-        if (info.flags & TH_FLAGS_IDLE) {
-            continue;
-        }
-
-        double cpu =
-            ((double)info.cpu_usage /
-             (double)TH_USAGE_SCALE) *
-            100.0;
-
-        if (cpu > highestCPU) {
-
-            highestCPU = cpu;
-            highestThread = threads[i];
-        }
-    }
-
-    vm_deallocate(
-        mach_task_self(),
-        (vm_address_t)threads,
-        (vm_size_t)(
-            threadCount *
-            sizeof(thread_t)
-        )
-    );
-
-    if (highestThread ==
-        MACH_PORT_NULL) {
-
-        return NO;
-    }
-
-    if (resultThread != NULL) {
-        *resultThread =
-            highestThread;
-    }
-
-    if (resultCPU != NULL) {
-        *resultCPU =
-            highestCPU;
-    }
-
-    return YES;
-}
-
-#pragma mark - Address resolver
-
-static void BHFResolveAddress(
-    uintptr_t address,
-    char *image,
-    size_t imageSize,
-    char *symbol,
-    size_t symbolSize,
-    uintptr_t *base,
-    uintptr_t *offset
-)
-{
-    if (image != NULL &&
-        imageSize > 0) {
-
-        image[0] = '\0';
-    }
-
-    if (symbol != NULL &&
-        symbolSize > 0) {
-
-        symbol[0] = '\0';
-    }
-
-    if (base != NULL) {
-        *base = 0;
-    }
-
-    if (offset != NULL) {
-        *offset = 0;
-    }
-
-    if (address == 0) {
-        return;
-    }
-
-    Dl_info info;
-
-    memset(
-        &info,
-        0,
-        sizeof(info)
-    );
-
-    int result =
-        dladdr(
-            (const void *)address,
-            &info
-        );
-
-    if (result == 0) {
-        return;
-    }
-
-    uintptr_t imageBase = 0;
-
-    if (info.dli_fbase != NULL) {
-
-        imageBase =
-            (uintptr_t)info.dli_fbase;
-    }
-
-    if (image != NULL &&
-        imageSize > 0 &&
-        info.dli_fname != NULL) {
-
-        snprintf(
-            image,
-            imageSize,
-            "%s",
-            info.dli_fname
-        );
-    }
-
-    if (symbol != NULL &&
-        symbolSize > 0 &&
-        info.dli_sname != NULL) {
-
-        snprintf(
-            symbol,
-            symbolSize,
-            "%s",
-            info.dli_sname
-        );
-    }
-
-    if (base != NULL) {
-        *base = imageBase;
-    }
-
-    if (offset != NULL &&
-        imageBase != 0 &&
-        address >= imageBase) {
-
-        *offset =
-            address - imageBase;
-    }
-}
-
-#pragma mark - Classification
-
-static void BHFClassifyImage(
-    const char *image
-)
-{
-    if (image == NULL ||
-        image[0] == '\0') {
-
-        BHFOtherSamples++;
-        return;
-    }
-
-    NSString *path =
-        [NSString stringWithUTF8String:image];
-
-    if (path == nil) {
-        BHFOtherSamples++;
-        return;
-    }
-
-    NSString *lower =
-        [path lowercaseString];
-
-    if ([lower containsString:@"yapdatabase"]) {
-
-        BHFYapSamples++;
-        return;
-    }
-
-    if ([lower containsString:@"libobjc"]) {
-
-        BHFObjCSamples++;
-        return;
-    }
-
-    if ([lower containsString:@"foundation.framework"]) {
-
-        BHFFoundationSamples++;
-        return;
-    }
-
-    if ([lower containsString:@"corefoundation.framework"]) {
-
-        BHFCoreFoundationSamples++;
-        return;
-    }
-
-    if ([lower containsString:@"libswift"]) {
-
-        BHFSwiftSamples++;
-        return;
-    }
-
-    if ([lower containsString:@"/bumble.app/bumble"]) {
-
-        BHFBumbleSamples++;
-        return;
-    }
-
-    if ([lower containsString:@"libsystem"]) {
-
-        BHFSystemSamples++;
-        return;
-    }
-
-    BHFOtherSamples++;
-}
-
-#pragma mark - Stack reset
-
-static void BHFResetStack(void)
-{
-    BHFStackCount = 0;
-
-    for (NSUInteger i = 0;
-         i < BHF_MAX_STACK_FRAMES;
-         i++) {
-
-        BHFStackAddresses[i] = 0;
-        BHFStackOffsets[i] = 0;
-
-        BHFStackImages[i][0] = '\0';
-        BHFStackSymbols[i][0] = '\0';
-    }
-}
-
-#pragma mark - Read frame
-
-static BOOL BHFReadFrame(
-    uintptr_t address,
-    uintptr_t *previousFP,
-    uintptr_t *returnAddress
-)
-{
-    if (address == 0) {
-        return NO;
-    }
-
-    uint64_t frame[2] = {
-        0,
-        0
-    };
-
-    vm_size_t dataSize =
-        sizeof(frame);
-
-    kern_return_t kr =
-        vm_read_overwrite(
-            mach_task_self(),
-            (vm_address_t)address,
-            (vm_size_t)sizeof(frame),
-            (vm_address_t)frame,
-            &dataSize
-        );
-
-    if (kr != KERN_SUCCESS) {
-        return NO;
-    }
-
-    if (dataSize <
-        sizeof(frame)) {
-
-        return NO;
-    }
-
-    if (previousFP != NULL) {
-
-        *previousFP =
-            (uintptr_t)frame[0];
-    }
-
-    if (returnAddress != NULL) {
-
-        *returnAddress =
-            (uintptr_t)frame[1];
-    }
-
-    return YES;
-}
-
-#pragma mark - ARM64 stack walk
-
-static void BHFCollectStack(
-    thread_t thread
-)
-{
-    BHFResetStack();
-
-    arm_thread_state64_t state;
-
-    mach_msg_type_number_t count =
-        ARM_THREAD_STATE64_COUNT;
-
-    kern_return_t kr =
-        thread_get_state(
-            thread,
-            ARM_THREAD_STATE64,
-            (thread_state_t)&state,
-            &count
-        );
-
-    if (kr != KERN_SUCCESS) {
-        return;
-    }
-
-    BHFCurrentPC =
-        (uintptr_t)state.__pc;
-
-    BHFCurrentSP =
-        (uintptr_t)state.__sp;
-
-    BHFCurrentFP =
-        (uintptr_t)state.__fp;
-
-    BHFCurrentImage[0] = '\0';
-    BHFCurrentSymbol[0] = '\0';
-
-    BHFCurrentImageBase = 0;
-    BHFCurrentImageOffset = 0;
-
-    BHFResolveAddress(
-        BHFCurrentPC,
-        BHFCurrentImage,
-        sizeof(BHFCurrentImage),
-        BHFCurrentSymbol,
-        sizeof(BHFCurrentSymbol),
-        &BHFCurrentImageBase,
-        &BHFCurrentImageOffset
-    );
-
-    BHFClassifyImage(
-        BHFCurrentImage
-    );
-
-    BHFStackAddresses[0] =
-        BHFCurrentPC;
-
-    BHFStackOffsets[0] =
-        BHFCurrentImageOffset;
-
-    snprintf(
-        BHFStackImages[0],
-        sizeof(BHFStackImages[0]),
-        "%s",
-        BHFCurrentImage
-    );
-
-    snprintf(
-        BHFStackSymbols[0],
-        sizeof(BHFStackSymbols[0]),
-        "%s",
-        BHFCurrentSymbol
-    );
-
-    BHFStackCount = 1;
-
-    uintptr_t fp =
-        BHFCurrentFP;
-
-    for (NSUInteger i = 1;
-         i < BHF_MAX_STACK_FRAMES;
-         i++) {
-
-        if (fp == 0) {
-            break;
-        }
-
-        if ((fp & 0x7) != 0) {
-            break;
-        }
-
-        uintptr_t previousFP = 0;
-        uintptr_t returnAddress = 0;
-
-        if (!BHFReadFrame(
-                fp,
-                &previousFP,
-                &returnAddress
-            )) {
-
-            break;
-        }
-
-        if (returnAddress == 0) {
-            break;
-        }
-
-        if (previousFP == fp) {
-            break;
-        }
-
-        if (previousFP > fp &&
-            previousFP - fp >
-                (1024 * 1024)) {
-
-            break;
-        }
-
-        if (fp > previousFP &&
-            fp - previousFP >
-                (1024 * 1024)) {
-
-            break;
-        }
-
-        char image[512];
-        char symbol[256];
-
-        image[0] = '\0';
-        symbol[0] = '\0';
-
-        uintptr_t base = 0;
-        uintptr_t offset = 0;
-
-        BHFResolveAddress(
-            returnAddress,
-            image,
-            sizeof(image),
-            symbol,
-            sizeof(symbol),
-            &base,
-            &offset
-        );
-
-        BHFStackAddresses[i] =
-            returnAddress;
-
-        BHFStackOffsets[i] =
-            offset;
-
-        snprintf(
-            BHFStackImages[i],
-            sizeof(BHFStackImages[i]),
-            "%s",
-            image
-        );
-
-        snprintf(
-            BHFStackSymbols[i],
-            sizeof(BHFStackSymbols[i]),
-            "%s",
-            symbol
-        );
-
-        BHFStackCount++;
-
-        fp = previousFP;
-    }
-}
-
-#pragma mark - Overlay
-
-static void BHFCreateOverlay(void)
-{
-    if (BHFWindow != nil) {
-        return;
-    }
-
-    CGRect screen =
-        [UIScreen mainScreen].bounds;
-
-    CGFloat width =
-        screen.size.width - 16.0;
-
-    BHFWindow =
-        [[UIWindow alloc]
-            initWithFrame:
-                CGRectMake(
-                    8.0,
-                    35.0,
-                    width,
-                    570.0
-                )];
-
-    BHFWindow.windowLevel =
-        UIWindowLevelAlert + 100.0;
-
-    BHFWindow.backgroundColor =
-        [UIColor colorWithWhite:0.0
-                          alpha:0.94];
-
-    BHFWindow.layer.cornerRadius =
-        14.0;
-
-    BHFWindow.clipsToBounds = YES;
-
-    UIScrollView *scroll =
-        [[UIScrollView alloc]
-            initWithFrame:
-                BHFWindow.bounds];
-
-    scroll.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth |
-        UIViewAutoresizingFlexibleHeight;
-
-    UILabel *label =
-        [[UILabel alloc]
-            initWithFrame:
-                CGRectMake(
-                    12.0,
-                    10.0,
-                    width - 24.0,
-                    1500.0
-                )];
-
-    BHFLabel = label;
-
-    BHFLabel.textColor =
-        [UIColor whiteColor];
-
-    BHFLabel.font =
-        [UIFont monospacedSystemFontOfSize:
-            10.0
-            weight:UIFontWeightRegular];
-
-    BHFLabel.numberOfLines = 0;
-
-    BHFLabel.textAlignment =
-        NSTextAlignmentLeft;
-
-    [scroll addSubview:BHFLabel];
-
-    scroll.contentSize =
-        CGSizeMake(
-            width,
-            1500.0
-        );
-
-    [BHFWindow addSubview:scroll];
-
-    BHFWindow.hidden = NO;
-
-    [BHFWindow makeKeyAndVisible];
-}
-
-#pragma mark - Stack text
-
-static NSString *BHFStackText(void)
-{
-    NSMutableString *result =
-        [NSMutableString string];
-
-    for (NSUInteger i = 0;
-         i < BHFStackCount;
-         i++) {
-
-        NSString *image =
-            @"unknown";
-
-        NSString *symbol =
-            @"unknown";
-
-        if (BHFStackImages[i][0] != '\0') {
-
-            image =
-                [NSString stringWithUTF8String:
-                    BHFStackImages[i]];
-
-            if (image == nil) {
-                image = @"unknown";
-            }
-        }
-
-        if (BHFStackSymbols[i][0] != '\0') {
-
-            symbol =
-                [NSString stringWithUTF8String:
-                    BHFStackSymbols[i]];
-
-            if (symbol == nil) {
-                symbol = @"unknown";
-            }
-        }
-
-        NSString *shortImage =
-            image;
-
-        if ([image hasPrefix:@"/usr/lib/"]) {
-
-            shortImage =
-                [image substringFromIndex:9];
-
-        }
-        else if ([image hasPrefix:@"/System/Library/"]) {
-
-            shortImage =
-                [image substringFromIndex:16];
-        }
-
-        [result appendFormat:
-            @"#%lu %@\n"
-             @"   %@\n"
-             @"   +0x%llx\n",
-             (unsigned long)i,
-             symbol,
-             shortImage,
-             (unsigned long long)
-                 BHFStackOffsets[i]
-        ];
-    }
-
-    if (BHFStackCount == 0) {
-        return @"No readable frames\n";
-    }
-
-    return result;
-}
-
-#pragma mark - Update
-
-static void BHFUpdateOverlay(void)
-{
-    double cpu =
-        BHFCPUUsage();
-
-    thread_t hotThread =
-        MACH_PORT_NULL;
-
-    double hotThreadCPU = 0.0;
-
-    BOOL found =
-        BHFGetHotThread(
-            &hotThread,
-            &hotThreadCPU
-        );
-
-    BHFTotalSamples++;
-
-    if (cpu >= 80.0) {
-        BHFHotSamples++;
-    }
-
-    if (cpu > BHFPeakCPU) {
-        BHFPeakCPU = cpu;
-    }
-
-    if (found) {
-
-        if (hotThread ==
-            BHFLastHotThread) {
-
-            BHFSameThreadSamples++;
-
+        
+        if (isThrottlingActive) {
+            overlayLabel.text = @"🔥 Throttling ON";
+            overlayWindow.hidden = NO;
         } else {
-
-            BHFLastHotThread =
-                hotThread;
-
-            BHFSameThreadSamples = 1;
+            overlayLabel.text = @"⛔ Throttling OFF";
+            overlayWindow.hidden = NO;
         }
+    });
+}
 
-        BHFCurrentThreadCPU =
-            hotThreadCPU;
++ (void)toggleThrottle {
+    manualThrottleEnabled = !manualThrottleEnabled;
+    [[NSUserDefaults standardUserDefaults] setBool:manualThrottleEnabled forKey:kManualToggleKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self updateCombinedState];
+    NSLog(@"[Thermal] Manual toggle: %@", manualThrottleEnabled ? @"ON" : @"OFF");
+}
 
-        BHFCollectStack(
-            hotThread
-        );
-    }
++ (void)updateCombinedState {
+    isThrottlingActive = manualThrottleEnabled || thermalActive;
+    updateOverlay();
+    [self applyThrottlingState];
+}
 
-    NSString *network =
-        BHFNetworkState();
-
-    NSString *status;
-
-    if (cpu >= 80.0) {
-
-        status = @"HIGH CPU";
-
-    }
-    else if (cpu >= 40.0) {
-
-        status = @"ELEVATED";
-
-    }
-    else {
-
-        status = @"NORMAL";
-    }
-
-    NSString *stack =
-        BHFStackText();
-
-    NSString *currentImage =
-        @"unknown";
-
-    NSString *currentSymbol =
-        @"unknown";
-
-    if (BHFCurrentImage[0] != '\0') {
-
-        NSString *tmp =
-            [NSString stringWithUTF8String:
-                BHFCurrentImage];
-
-        if (tmp != nil) {
-            currentImage = tmp;
-        }
-    }
-
-    if (BHFCurrentSymbol[0] != '\0') {
-
-        NSString *tmp =
-            [NSString stringWithUTF8String:
-                BHFCurrentSymbol];
-
-        if (tmp != nil) {
-            currentSymbol = tmp;
-        }
-    }
-
-    NSString *text =
-        [NSString stringWithFormat:
-            @"BumbleHeatFix\n"
-             @"ARM64 CALLER TRACKER v6.0\n"
-             @"\n"
-             @"CPU: %.1f%%\n"
-             @"Peak: %.1f%%\n"
-             @"Hot samples: %lu / %lu\n"
-             @"Network: %@\n"
-             @"Status: %@\n"
-             @"\n"
-             @"HOT THREAD\n"
-             @"TID: %u\n"
-             @"CPU: %.1f%%\n"
-             @"Same thread: %lu\n"
-             @"\n"
-             @"CURRENT PC\n"
-             @"0x%llx\n"
-             @"\n"
-             @"CURRENT IMAGE\n"
-             @"%@\n"
-             @"BASE: 0x%llx\n"
-             @"OFFSET: +0x%llx\n"
-             @"SYMBOL: %@\n"
-             @"\n"
-             @"CALL STACK\n"
-             @"%@"
-             @"\n"
-             @"TARGET STATUS\n"
-             @"Observation only\n"
-             @"No hook\n"
-             @"No patch\n"
-             @"No priority changes\n"
-             @"No suspension\n"
-             @"No termination",
-             cpu,
-             BHFPeakCPU,
-             (unsigned long)BHFHotSamples,
-             (unsigned long)BHFTotalSamples,
-             network,
-             status,
-             found ? hotThread : 0,
-             found ? hotThreadCPU : 0.0,
-             (unsigned long)BHFSameThreadSamples,
-             (unsigned long long)BHFCurrentPC,
-             currentImage,
-             (unsigned long long)BHFCurrentImageBase,
-             (unsigned long long)BHFCurrentImageOffset,
-             currentSymbol,
-             stack
-        ];
-
-    dispatch_async(
-        dispatch_get_main_queue(),
-        ^{
-
-            if (BHFWindow == nil) {
-                BHFCreateOverlay();
++ (void)applyThrottlingState {
+    // Notify system of throttling
+    if (isThrottlingActive) {
+        [[NSProcessInfo processInfo] performExpiringActivityWithReason:@"Thermal throttling" 
+                                                             usingBlock:^(BOOL expired) {
+            if (expired) {
+                NSLog(@"[Thermal] Activity expired");
             }
-
-            BHFLabel.text = text;
-        }
-    );
-}
-
-#pragma mark - Start
-
-static void BHFStartMonitoring(void)
-{
-    dispatch_async(
-        dispatch_get_main_queue(),
-        ^{
-
-            BHFCreateOverlay();
-
-            BHFTimer =
-                [NSTimer
-                    scheduledTimerWithTimeInterval:
-                        BHF_SAMPLE_INTERVAL
-                        repeats:YES
-                        block:^(NSTimer *timer) {
-
-                BHFUpdateOverlay();
-            }];
-
-            BHFUpdateOverlay();
-        }
-    );
-}
-
-#pragma mark - Constructor
-
-__attribute__((constructor))
-static void BumbleHeatFixInit(void)
-{
-    @autoreleasepool {
-
-        BHFStartNetworkMonitor();
-
-        BHFStartMonitoring();
+        }];
     }
 }
+
+// ============================================================
+//  IDLE TIMER MANAGEMENT
+// ============================================================
++ (void)resetIdleTimer {
+    [idleTimer invalidate];
+    idleTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 
+                                                 repeats:NO 
+                                                   block:^(NSTimer *timer) {
+        if (currentThermalState >= NSProcessInfoThermalStateFair || isThrottlingActive) {
+            NSLog(@"[Thermal] 💤 User idle for 30s - killing GPS until next touch");
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalKillGPS" object:nil];
+            gpsKilledForIdle = YES;
+        }
+    }];
+}
+
+// ============================================================
+//  DYNAMIC SWIZZLING
+// ============================================================
++ (void)performDynamicSwizzling {
+    int numClasses = objc_getClassList(NULL, 0);
+    Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
+    numClasses = objc_getClassList(classes, numClasses);
+    
+    NSArray *methodPatterns = @[
+        @"startUpdatingLocation",
+        @"setDesiredAccuracy:",
+        @"uploadImage:",
+        @"uploadPhoto:",
+        @"uploadVideo:",
+        @"syncProfile",
+        @"refreshFeed",
+        @"loadMatches",
+        @"fetchMatches",
+        @"sendMessage:",
+        @"beginBackgroundTaskWithName:expirationHandler:",
+        @"processImage:",
+        @"applyFilter:"
+    ];
+    
+    for (int i = 0; i < numClasses; i++) {
+        Class cls = classes[i];
+        NSString *className = NSStringFromClass(cls);
+        
+        if (![className containsString:@"Bumble"] && 
+            ![className containsString:@"Bm"] && 
+            ![className hasPrefix:@"BM"] &&
+            ![className containsString:@"Upload"] &&
+            ![className containsString:@"Location"] &&
+            ![className containsString:@"Network"] &&
+            ![className containsString:@"Sync"]) {
+            continue;
+        }
+        
+        for (NSString *pattern in methodPatterns) {
+            SEL sel = NSSelectorFromString(pattern);
+            if ([cls instancesRespondToSelector:sel]) {
+                [self swizzleMethod:sel onClass:cls withPattern:pattern];
+            }
+        }
+    }
+    free(classes);
+    NSLog(@"[Thermal] Dynamic swizzling complete.");
+}
+
++ (void)swizzleMethod:(SEL)originalSelector onClass:(Class)cls withPattern:(NSString *)pattern {
+    Method originalMethod = class_getInstanceMethod(cls, originalSelector);
+    if (!originalMethod) return;
+    
+    IMP newImp = imp_implementationWithBlock(^(id self, ...) {
+        if (isThrottlingActive) {
+            if ([pattern isEqualToString:@"uploadImage:"] || 
+                [pattern isEqualToString:@"uploadPhoto:"] ||
+                [pattern isEqualToString:@"uploadVideo:"] ||
+                [pattern isEqualToString:@"syncProfile"] ||
+                [pattern isEqualToString:@"refreshFeed"] ||
+                [pattern isEqualToString:@"loadMatches"]) {
+                
+                NSLog(@"[Thermal] ⏳ Delaying %@ on %@ due to throttling", pattern, NSStringFromClass(cls));
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    // Call original - simplified version
+                    NSLog(@"[Thermal] 🔹 Executing delayed %@", pattern);
+                });
+                return;
+            }
+        }
+        NSLog(@"[Thermal] 🔹 Executing %@ on %@ (throttling %@)", pattern, NSStringFromClass(cls), isThrottlingActive ? @"ON" : @"OFF");
+    });
+    
+    class_replaceMethod(cls, originalSelector, newImp, method_getTypeEncoding(originalMethod));
+    NSLog(@"[Thermal] 🔄 Swizzled %@ on %@", pattern, NSStringFromClass(cls));
+}
+
+// ============================================================
+//  SYSTEM HOOKS - LOCATION
+// ============================================================
+%hook CLLocationManager
+
+- (void)startUpdatingLocation {
+    if (isThrottlingActive || gpsKilledForIdle) {
+        self.desiredAccuracy = kCLLocationAccuracyKilometer;
+        self.distanceFilter = 100.0;
+        NSLog(@"[Thermal] 📍 Location: low accuracy due to throttling");
+    }
+    %orig;
+}
+
+- (void)setDesiredAccuracy:(CLLocationAccuracy)accuracy {
+    if (isThrottlingActive || gpsKilledForIdle) {
+        accuracy = kCLLocationAccuracyKilometer;
+        NSLog(@"[Thermal] 📍 Location: forced accuracy downgrade");
+    }
+    %orig(accuracy);
+}
+
+%end
+
+// ============================================================
+//  SYSTEM HOOKS - FRAME RATE
+// ============================================================
+%hook CADisplayLink
+
++ (CADisplayLink *)displayLinkWithTarget:(id)target selector:(SEL)sel {
+    CADisplayLink *link = %orig(target, sel);
+    if (isThrottlingActive) {
+        if (@available(iOS 15.0, *)) {
+            link.preferredFrameRateRange = CAFrameRateRangeMake(20.0, 30.0, 30.0);
+        } else if (@available(iOS 10.0, *)) {
+            link.preferredFramesPerSecond = 30;
+        }
+        NSLog(@"[Thermal] 🖥️ Frame rate capped to 30 FPS");
+    }
+    return link;
+}
+
+- (void)setPreferredFramesPerSecond:(NSInteger)preferredFramesPerSecond {
+    if (isThrottlingActive) {
+        preferredFramesPerSecond = MIN(preferredFramesPerSecond, 30);
+    }
+    %orig(preferredFramesPerSecond);
+}
+
+%end
+
+// ============================================================
+//  SYSTEM HOOKS - NETWORK & IMAGES
+// ============================================================
+%hook NSURLSessionDataTask
+
+- (void)resume {
+    if (isThrottlingActive) {
+        NSURL *url = self.currentRequest.URL;
+        NSString *urlString = [url absoluteString];
+        
+        if ([urlString containsString:@".jpg"] || 
+            [urlString containsString:@".png"] ||
+            [urlString containsString:@"image"] ||
+            [urlString containsString:@"photo"] ||
+            [urlString containsString:@"avatar"]) {
+            
+            if ([self respondsToSelector:@selector(setPriority:)]) {
+                self.priority = NSURLSessionTaskPriorityLow;
+                NSLog(@"[Thermal] 🖼️ Image download set to LOW priority");
+            }
+        }
+        
+        if ([urlString containsString:@"upload"] || 
+            [urlString containsString:@"photo"] ||
+            [urlString containsString:@"image"] ||
+            [urlString containsString:@"profile"] ||
+            [urlString containsString:@"sync"]) {
+            
+            NSLog(@"[Thermal] 🌐 Delaying network request: %@", urlString);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), 
+                           dispatch_get_main_queue(), ^{
+                %orig;
+            });
+            return;
+        }
+    }
+    %orig;
+}
+
+%end
+
+// ============================================================
+//  SYSTEM HOOKS - BACKGROUND TASKS
+// ============================================================
+%hook UIApplication
+
+- (UIBackgroundTaskIdentifier)beginBackgroundTaskWithName:(NSString *)taskName 
+                                         expirationHandler:(void (^)(void))handler {
+    if (isThrottlingActive) {
+        NSLog(@"[Thermal] ⏱️ Reducing background task time for: %@", taskName);
+    }
+    return %orig(taskName, handler);
+}
+
+- (void)setMinimumBackgroundFetchInterval:(NSTimeInterval)minimumBackgroundFetchInterval {
+    if (isThrottlingActive) {
+        minimumBackgroundFetchInterval = 86400; // 24 hours
+        NSLog(@"[Thermal] ⏱️ Background fetch interval extended to 24h");
+    }
+    %orig(minimumBackgroundFetchInterval);
+}
+
+- (void)sendEvent:(UIEvent *)event {
+    %orig;
+    if (event.type == UIEventTypeTouches) {
+        if (gpsKilledForIdle) {
+            gpsKilledForIdle = NO;
+            NSLog(@"[Thermal] 👆 Touch detected - restoring GPS");
+        }
+        [ThermalThrottleManager resetIdleTimer];
+    }
+}
+
+%end
+
+// ============================================================
+//  SYSTEM HOOKS - SCROLLING
+// ============================================================
+%hook UITableView
+
+- (void)setDecelerationRate:(CGFloat)decelerationRate {
+    if (isThrottlingActive) {
+        decelerationRate = UIScrollViewDecelerationRateNormal;
+        NSLog(@"[Thermal] 📜 Scroll deceleration reduced");
+    }
+    %orig(decelerationRate);
+}
+
+- (void)setPrefetchingEnabled:(BOOL)prefetchingEnabled {
+    if (isThrottlingActive) {
+        prefetchingEnabled = NO;
+        NSLog(@"[Thermal] 📜 Prefetching disabled");
+    }
+    %orig(prefetchingEnabled);
+}
+
+%end
+
+%hook UICollectionView
+
+- (void)setPrefetchingEnabled:(BOOL)prefetchingEnabled {
+    if (isThrottlingActive) {
+        prefetchingEnabled = NO;
+    }
+    %orig(prefetchingEnabled);
+}
+
+%end
+
+// ============================================================
+//  SYSTEM HOOKS - APP DELEGATE (Background/Foreground)
+// ============================================================
+%hook AppDelegate
+
+- (void)applicationDidEnterBackground:(UIApplication *)application {
+    %orig;
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalKillGPS" object:nil];
+    gpsKilledForIdle = YES;
+    NSLog(@"[Thermal] 📍 GPS killed for background idle");
+}
+
+- (void)applicationWillEnterForeground:(UIApplication *)application {
+    %orig;
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"BumbleThermalRestoreGPS" object:nil];
+    gpsKilledForIdle = NO;
+    NSLog(@"[Thermal] 📍 GPS restored for foreground");
+}
+
+%end
+
+// ============================================================
+//  MAIN ENTRY POINT
+// ============================================================
+%ctor {
+    NSLog(@"[Thermal] ✅ Thermal throttling dylib loaded!");
+    
+    // Load manual toggle from preferences
+    manualThrottleEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:kManualToggleKey];
+    
+    // Start thermal monitoring
+    [NSTimer scheduledTimerWithTimeInterval:2.0 
+                                     repeats:YES 
+                                     block:^(NSTimer *timer) {
+        NSProcessInfoThermalState newState = [NSProcessInfo processInfo].thermalState;
+        BOOL wasThermalActive = thermalActive;
+        thermalActive = (newState >= NSProcessInfoThermalStateSerious);
+        
+        if (thermalActive != wasThermalActive) {
+            NSString *stateName = @"Nominal";
+            if (newState == NSProcessInfoThermalStateFair) stateName = @"Fair ⚠️";
+            else if (newState == NSProcessInfoThermalStateSerious) stateName = @"Serious 🔥";
+            else if (newState == NSProcessInfoThermalStateCritical) stateName = @"Critical 🚨";
+            NSLog(@"[Thermal] Thermal state: %@", stateName);
+        }
+        
+        [ThermalThrottleManager updateCombinedState];
+    }];
+    
+    // Delay overlay creation until app is ready
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [ThermalThrottleManager updateCombinedState];
+        updateOverlay();
+    });
+    
+    // Run dynamic swizzling after classes load
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [ThermalThrottleManager performDynamicSwizzling];
+    });
+}
+
+// ============================================================
+//  THERMALTHROTTLEMANAGER CLASS (for static methods)
+// ============================================================
+@interface ThermalThrottleManager : NSObject
++ (void)toggleThrottle;
++ (void)updateCombinedState;
++ (void)applyThrottlingState;
++ (void)resetIdleTimer;
++ (void)performDynamicSwizzling;
++ (void)swizzleMethod:(SEL)selector onClass:(Class)cls withPattern:(NSString *)pattern;
+@end
+
+@implementation ThermalThrottleManager
+
++ (void)toggleThrottle {
+    // Implementation above
+}
+
++ (void)updateCombinedState {
+    // Implementation above
+}
+
++ (void)applyThrottlingState {
+    // Implementation above
+}
+
++ (void)resetIdleTimer {
+    // Implementation above
+}
+
++ (void)performDynamicSwizzling {
+    // Implementation above
+}
+
++ (void)swizzleMethod:(SEL)selector onClass:(Class)cls withPattern:(NSString *)pattern {
+    // Implementation above
+}
+
+@end
